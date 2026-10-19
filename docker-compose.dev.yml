@@ -24,9 +24,9 @@ services:
       dockerfile: Dockerfile.dev
       target: !reset null
     environment:
-      # Windows/WSL2 bind mounts don't reliably forward file events into the
-      # container, so uvicorn --reload can silently miss host edits. Polling
-      # trades a bit of CPU for reloads that actually fire.
+      # Bind mounts don't always forward file events into the container
+      # (e.g. under Docker Desktop), so uvicorn --reload can silently miss
+      # host edits. Polling trades a bit of CPU for reloads that actually fire.
       WATCHFILES_FORCE_POLLING: "true"
     volumes:
       - ./app:/app/app

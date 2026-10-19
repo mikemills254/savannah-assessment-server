@@ -1,8 +1,16 @@
 from datetime import datetime
+from typing import Annotated
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 from app.models.appointment import AppointmentStatus
 from app.schemas.doctor import FacilitySummary
@@ -23,6 +31,21 @@ class StaffAppointmentCreate(AppointmentCreate):
     """A facility admin booking on a patient's behalf."""
 
     patient: PatientRef
+
+
+class AppointmentCancel(BaseModel):
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+        Field(examples=["Feeling better, no longer need the visit"]),
+    ]
+
+
+class AppointmentReschedule(BaseModel):
+    """The new start, with the same doctor. Same rules as starts_at when
+    booking."""
+
+    starts_at: AwareDatetime = Field(examples=["2026-10-21T14:30:00+03:00"])
 
 
 class PersonSummary(BaseModel):
@@ -50,6 +73,8 @@ class AppointmentRead(BaseModel):
     booked_by: PersonSummary | None
     # Set once cancelled: the patient, the doctor or a facility admin.
     cancelled_by: PersonSummary | None
+    # Set once cancelled. Null for cancellations made before it was recorded.
+    cancellation_reason: str | None
     facility: FacilitySummary
 
     @model_validator(mode="after")

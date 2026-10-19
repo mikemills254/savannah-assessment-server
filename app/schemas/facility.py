@@ -19,8 +19,9 @@ from app.schemas.user import PersonName
 
 @cache
 def _timezone_names() -> frozenset[str]:
-    # Checked against the list rather than by loading the zone: on Windows,
-    # ZoneInfo("America") (a folder in tzdata) raises PermissionError.
+    # Checked against the list rather than by loading the zone: a tzdata
+    # folder name such as "America" can raise an OSError instead of
+    # ZoneInfoNotFoundError.
     return frozenset(available_timezones())
 
 

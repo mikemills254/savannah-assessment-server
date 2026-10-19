@@ -15,8 +15,10 @@ from app.dependencies.db import DbSession
 from app.models.appointment import Appointment, AppointmentStatus
 from app.schemas.appointment import (
     AppointmentBooked,
+    AppointmentCancel,
     AppointmentCreate,
     AppointmentRead,
+    AppointmentReschedule,
     StaffAppointmentCreate,
 )
 from app.services.appointments import AppointmentService
@@ -95,18 +97,40 @@ def get_appointment(
     return AppointmentService(db).get(user, appointment_id)
 
 
-@router.post(
+@router.patch(
     "/appointments/{appointment_id}/cancel",
     response_model=AppointmentRead,
 )
 def cancel_appointment(
     appointment_id: UUID,
+    body: AppointmentCancel,
     user: CurrentUser,
     db: DbSession,
 ) -> Appointment:
-    """Its patient, its doctor, or an admin of its facility. The slot becomes
-    free again. 409 if it's already cancelled or has started."""
-    return AppointmentService(db).cancel(user, appointment_id)
+    """Its patient, its doctor, or an admin of its facility, giving a reason.
+    The slot becomes free again. 409 if it's already cancelled or has
+    started; 422 if the reason is missing or blank."""
+    return AppointmentService(db).cancel(user, appointment_id, reason=body.reason)
+
+
+@router.patch(
+    "/appointments/{appointment_id}/reschedule",
+    response_model=AppointmentRead,
+)
+def reschedule_appointment(
+    appointment_id: UUID,
+    body: AppointmentReschedule,
+    user: CurrentUser,
+    db: DbSession,
+) -> Appointment:
+    """Move to another slot with the same doctor; whoever may cancel it may
+    move it. The old slot becomes free again. The new one is checked as for
+    a booking: 400 if it's off the half-hour grid, in the past or outside
+    working hours, 409 if it's taken. 409 if the appointment is cancelled or
+    has started. Sending its current time changes nothing."""
+    return AppointmentService(db).reschedule(
+        user, appointment_id, starts_at=body.starts_at
+    )
 
 
 @router.post(

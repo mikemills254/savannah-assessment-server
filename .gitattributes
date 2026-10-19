@@ -1,0 +1,3 @@
+# LF everywhere, whatever the checkout's git settings: the code runs in
+# Linux containers, where CRLF breaks shell scripts and entrypoints.
+* text=auto eol=lf

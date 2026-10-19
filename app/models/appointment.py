@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    String,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -129,6 +130,13 @@ class Appointment(Base):
     # booked, and for cancellations made before this was recorded.
     cancelled_by_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT", name="fk_appointments_cancelled_by"),
+        nullable=True,
+    )
+
+    # Why it was cancelled, as given by whoever cancelled it. Null while
+    # booked, and for cancellations made before this was recorded.
+    cancellation_reason: Mapped[str | None] = mapped_column(
+        String(500),
         nullable=True,
     )
 

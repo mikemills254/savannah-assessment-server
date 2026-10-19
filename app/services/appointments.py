@@ -46,6 +46,14 @@ class AlreadyStartedError(ConflictError):
     detail = "This appointment has already started and can't be cancelled"
 
 
+class CancelledAppointmentError(ConflictError):
+    detail = "This appointment is cancelled and can't be rescheduled; book a new one"
+
+
+class DoctorUnavailableError(ConflictError):
+    detail = "This doctor is no longer taking bookings; cancel and book another"
+
+
 class IdempotencyKeyReusedError(AppError):
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
     detail = "This Idempotency-Key was already used for a different booking"
@@ -173,11 +181,7 @@ class AppointmentService:
         starts_at: datetime,
         key_row: IdempotencyKey | None,
     ) -> Appointment:
-        """Validate the slot and save the booking.
-
-        The partial unique indexes are what stop concurrent requests double
-        booking the doctor or the patient; the checks before them only give
-        clearer errors for the common cases."""
+        """Validate the slot and save the booking."""
         self._check_slot(doctor, starts_at)
         appointment = Appointment(
             facility_id=doctor.facility_id,
@@ -188,6 +192,19 @@ class AppointmentService:
             ends_at=slot_end(starts_at),
         )
         self.db.add(appointment)
+        self._flush_slot()
+
+        if key_row is not None:
+            key_row.appointment_id = appointment.id
+        self.db.commit()
+        return self._get_with_details(appointment.id)
+
+    def _flush_slot(self) -> None:
+        """Flush a new or moved booking.
+
+        The partial unique indexes are what stop concurrent requests double
+        booking the doctor or the patient; the checks before them only give
+        clearer errors for the common cases."""
         try:
             self.db.flush()
         except IntegrityError as exc:
@@ -198,11 +215,6 @@ class AppointmentService:
             if constraint == "uq_active_patient_slot":
                 raise PatientAlreadyBookedError from None
             raise
-
-        if key_row is not None:
-            key_row.appointment_id = appointment.id
-        self.db.commit()
-        return self._get_with_details(appointment.id)
 
     def _check_slot(self, doctor: User, starts_at: datetime) -> None:
         tz = ZoneInfo(doctor.facility.timezone)
@@ -232,9 +244,10 @@ class AppointmentService:
             raise AppointmentNotFoundError
         return appointment
 
-    def cancel(self, user: User, appointment_id: UUID) -> Appointment:
+    def cancel(self, user: User, appointment_id: UUID, *, reason: str) -> Appointment:
         """Cancel a booked appointment, which frees its slot. The record is
-        kept. Cancelling twice is a 409, and nothing changes."""
+        kept, with who cancelled it and why. Cancelling twice is a 409, and
+        nothing changes."""
         # Locked so a concurrent cancellation waits and then sees CANCELLED.
         appointment = self.db.get(Appointment, appointment_id, with_for_update=True)
         if appointment is None or not self._can(user, appointment, view=True):
@@ -251,6 +264,44 @@ class AppointmentService:
         appointment.status = AppointmentStatus.CANCELLED
         appointment.cancelled_at = now
         appointment.cancelled_by_id = user.id
+        appointment.cancellation_reason = reason
+        self.db.commit()
+        return self._get_with_details(appointment.id)
+
+    def reschedule(
+        self, user: User, appointment_id: UUID, *, starts_at: datetime
+    ) -> Appointment:
+        """Move a booked appointment to another slot with the same doctor.
+        Allowed for whoever may cancel it. The new slot is validated as for a
+        new booking, and the old one is free as soon as this commits, since
+        it's the same row moved. Moving to the time it already has changes
+        nothing, so a retry after a lost response is safe."""
+        # Locked so a concurrent cancel or reschedule waits for this one.
+        appointment = self.db.get(Appointment, appointment_id, with_for_update=True)
+        if appointment is None or not self._can(user, appointment, view=True):
+            raise AppointmentNotFoundError
+        if not self._can(user, appointment, view=False):
+            raise ForbiddenError("You can't reschedule this appointment")
+        if appointment.status == AppointmentStatus.CANCELLED:
+            raise CancelledAppointmentError
+        if appointment.starts_at <= datetime.now(UTC):
+            raise AlreadyStartedError(
+                "This appointment has already started and can't be rescheduled"
+            )
+
+        starts_at = starts_at.astimezone(UTC)
+        if starts_at == appointment.starts_at:
+            return self._get_with_details(appointment.id)
+
+        try:
+            doctor = DoctorService(self.db).get_bookable(appointment.doctor_id)
+        except DoctorNotFoundError:
+            raise DoctorUnavailableError from None
+        self._check_slot(doctor, starts_at)
+
+        appointment.starts_at = starts_at
+        appointment.ends_at = slot_end(starts_at)
+        self._flush_slot()
         self.db.commit()
         return self._get_with_details(appointment.id)
 
