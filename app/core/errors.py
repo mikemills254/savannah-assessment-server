@@ -22,6 +22,11 @@ class InvalidRequestError(AppError):
     status_code = status.HTTP_400_BAD_REQUEST
 
 
+class ForbiddenError(AppError):
+    status_code = status.HTTP_403_FORBIDDEN
+    detail = "You do not have permission to perform this action"
+
+
 class NotFoundError(AppError):
     status_code = status.HTTP_404_NOT_FOUND
     detail = "Not found"

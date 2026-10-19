@@ -1,0 +1,70 @@
+# Dev override — layer on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+services:
+  postgres:
+    environment:
+      # Defaults for psql inside the container, so `task db:psql` is just `psql`.
+      PGUSER: ${POSTGRES_USER}
+      PGDATABASE: ${POSTGRES_DB}
+
+  migrate:
+    image: assessment-server:dev
+    build:
+      dockerfile: Dockerfile.dev
+      target: !reset null
+    volumes:
+      # A new migration (or a model it imports) is picked up without a rebuild.
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+      - ./app:/app/app
+
+  app:
+    image: assessment-server:dev
+    build:
+      dockerfile: Dockerfile.dev
+      target: !reset null
+    environment:
+      # Windows/WSL2 bind mounts don't reliably forward file events into the
+      # container, so uvicorn --reload can silently miss host edits. Polling
+      # trades a bit of CPU for reloads that actually fire.
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: assessment-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@clinic.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5056}:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [assessment]
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: assessment-redis-commander
+    restart: unless-stopped
+    environment:
+      # label:host:port:db:password
+      REDIS_HOSTS: assessment:redis:6379:0:${REDIS_PASSWORD}
+      HTTP_USER: ${REDIS_COMMANDER_USER:-admin}
+      HTTP_PASSWORD: ${REDIS_COMMANDER_PASSWORD:-admin}
+    ports:
+      - "127.0.0.1:${REDIS_COMMANDER_PORT:-8085}:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [assessment]
+
+volumes:
+  pgadmin_data:

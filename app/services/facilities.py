@@ -1,5 +1,6 @@
 from uuid import UUID
 
+from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from app.core.security import create_invite_token
 from app.models.facility import Facility
 from app.models.user import User
 from app.services.auth import AuthService
+from app.services.email import send_doctor_invite
 
 
 class MemberAlreadyExistsError(ConflictError):
@@ -70,10 +72,12 @@ class FacilityService:
         email: str,
         role: UserRole,
         name: str | None,
+        background_tasks: BackgroundTasks,
     ) -> tuple[User, str | None]:
         """Create a staff account at the facility, or reactivate a
         deactivated one of its own with the given role. Returns the member
         and, if they have never set a password, an invite token to do so.
+        A doctor is also emailed the invite after the response is sent.
 
         An email that belongs to any other account is refused: an account
         has one role, so a patient or another facility's staff can't be
@@ -115,7 +119,9 @@ class FacilityService:
                 "This person was just added by another request; reload and try again"
             ) from None
 
-        return user, self._invite_token_for(user)
+        token = self._invite_token_for(user)
+        self._email_invite(background_tasks, user, facility, token)
+        return user, token
 
     def deactivate_member(self, facility: Facility, member_id: UUID) -> User:
         """Deactivate a staff account: they can no longer log in, and a
@@ -143,12 +149,38 @@ class FacilityService:
         self.db.commit()
         return member
 
-    def reissue_invite(self, facility: Facility, member_id: UUID) -> str:
+    def reissue_invite(
+        self,
+        facility: Facility,
+        member_id: UUID,
+        *,
+        background_tasks: BackgroundTasks,
+    ) -> str:
         member = self._get_member(facility, member_id)
         token = self._invite_token_for(member)
         if token is None:
             raise ConflictError("This person has already set a password")
+        self._email_invite(background_tasks, member, facility, token)
         return token
+
+    @staticmethod
+    def _email_invite(
+        background_tasks: BackgroundTasks,
+        user: User,
+        facility: Facility,
+        token: str | None,
+    ) -> None:
+        # Only doctors for now: the template is written for them. Admins
+        # still get the token in the response to share by hand.
+        if token is None or user.role != UserRole.DOCTOR:
+            return
+        background_tasks.add_task(
+            send_doctor_invite,
+            email=user.email,
+            name=user.name,
+            facility_name=facility.name,
+            token=token,
+        )
 
     def _get_member(self, facility: Facility, member_id: UUID) -> User:
         member = self.db.get(User, member_id)

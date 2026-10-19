@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+# Dev image — app/ and alembic/ are bind-mounted by docker-compose.dev.yml for hot reload.
+
+FROM python:3.13-slim
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+# Overridden by the bind mounts; kept so the image also runs on its own.
+COPY . .
+
+ARG PORT=8000
+ENV PORT=${PORT}
+EXPOSE ${PORT}
+
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port \"$PORT\" --reload --reload-dir app"]

@@ -24,6 +24,9 @@ class FacilityPermission(str, Enum):
     APPOINTMENTS_VIEW_OWN = "appointments:view_own"
     APPOINTMENTS_CANCEL_ANY = "appointments:cancel_any"
     APPOINTMENTS_CANCEL_OWN = "appointments:cancel_own"
+    # Book on a patient's behalf (phone, walk-in), creating their account if
+    # they don't have one, and look up and invite the facility's patients.
+    APPOINTMENTS_BOOK_ANY = "appointments:book_any"
 
 
 # What staff may do at their own facility. "_OWN" permissions still need an

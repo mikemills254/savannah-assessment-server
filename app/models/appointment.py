@@ -48,6 +48,16 @@ class Appointment(Base):
             unique=True,
             postgresql_where=text("status = 'BOOKED'"),
         ),
+        # A patient can't hold two bookings at the same time at one facility,
+        # e.g. with two of its doctors.
+        Index(
+            "uq_active_patient_slot",
+            "facility_id",
+            "patient_id",
+            "starts_at",
+            unique=True,
+            postgresql_where=text("status = 'BOOKED'"),
+        ),
         Index(
             "ix_appointments_patient_starts_at",
             "patient_id",
@@ -75,6 +85,13 @@ class Appointment(Base):
     patient_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
+    )
+
+    # Who made the booking: the patient themselves, or a facility admin on
+    # their behalf. Null for bookings made before this was recorded.
+    booked_by_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT", name="fk_appointments_booked_by"),
+        nullable=True,
     )
 
     starts_at: Mapped[datetime] = mapped_column(
@@ -108,6 +125,13 @@ class Appointment(Base):
         nullable=True,
     )
 
+    # Who cancelled: the patient, the doctor, or a facility admin. Null while
+    # booked, and for cancellations made before this was recorded.
+    cancelled_by_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT", name="fk_appointments_cancelled_by"),
+        nullable=True,
+    )
+
     facility: Mapped["Facility"] = relationship(
         back_populates="appointments",
     )
@@ -121,4 +145,12 @@ class Appointment(Base):
     patient: Mapped["User"] = relationship(
         back_populates="appointments",
         foreign_keys=[patient_id],
+    )
+
+    booked_by: Mapped["User | None"] = relationship(
+        foreign_keys=[booked_by_id],
+    )
+
+    cancelled_by: Mapped["User | None"] = relationship(
+        foreign_keys=[cancelled_by_id],
     )

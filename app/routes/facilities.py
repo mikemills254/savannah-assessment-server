@@ -1,7 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Depends, status
 
 from app.core.permissions import FacilityPermission
 from app.dependencies.auth import (
@@ -70,14 +70,17 @@ def add_member(
     body: MemberCreate,
     access: ManageMembers,
     db: DbSession,
+    background_tasks: BackgroundTasks,
 ) -> MemberCreated:
     """Create a FACILITY_ADMIN or DOCTOR account here, or reactivate a
-    deactivated one of this facility's. Emails of other accounts are refused."""
+    deactivated one of this facility's. Emails of other accounts are refused.
+    A doctor who needs to set a password is emailed the invite."""
     member, invite_token = FacilityService(db).add_member(
         access.facility,
         email=body.email,
         role=body.role,
         name=body.name,
+        background_tasks=background_tasks,
     )
     return MemberCreated(
         member=MemberRead.model_validate(member),
@@ -107,7 +110,11 @@ def reissue_invite(
     member_id: UUID,
     access: ManageMembers,
     db: DbSession,
+    background_tasks: BackgroundTasks,
 ) -> InviteRead:
-    """New invite for a member who hasn't set a password yet (e.g. the old one expired)."""
-    token = FacilityService(db).reissue_invite(access.facility, member_id)
+    """New invite for a member who hasn't set a password yet (e.g. the old
+    one expired). Doctors are emailed it too."""
+    token = FacilityService(db).reissue_invite(
+        access.facility, member_id, background_tasks=background_tasks
+    )
     return InviteRead(invite_token=token)
