@@ -1,4 +1,5 @@
 from datetime import date, datetime, time
+from itertools import pairwise
 from typing import Annotated
 from uuid import UUID
 
@@ -66,7 +67,7 @@ class WorkingHoursUpdate(BaseModel):
     @model_validator(mode="after")
     def _no_overlaps(self) -> "WorkingHoursUpdate":
         ordered = sorted(self.periods, key=lambda p: (p.weekday, p.start_time))
-        for previous, current in zip(ordered, ordered[1:]):
+        for previous, current in pairwise(ordered):
             if (
                 previous.weekday == current.weekday
                 and current.start_time < previous.end_time

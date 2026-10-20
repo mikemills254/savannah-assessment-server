@@ -1,4 +1,7 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated
+
+from pydantic import AliasChoices, Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -21,6 +24,35 @@ class Settings(BaseSettings):
     mail_port: int = 587
     # Base URL of the web client; invite emails link to <frontend_url>/accept-invite.
     frontend_url: str = "http://localhost:5173"
+
+    # Browser origins allowed to call the API, comma-separated, e.g.
+    # "https://clinic.example.com,https://staging.clinic.example.com". Empty
+    # allows none, which is fine locally where Vite proxies the API.
+    cors_origins: Annotated[list[str], NoDecode] = []
+
+    # The deployed commit, shown by /health so a deploy can check it's live.
+    # Render sets RENDER_GIT_COMMIT; elsewhere set GIT_COMMIT.
+    git_commit: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GIT_COMMIT", "RENDER_GIT_COMMIT"),
+    )
+
+    @field_validator("database_url")
+    @classmethod
+    def _use_psycopg(cls, value: str) -> str:
+        # Hosts hand out postgres:// or postgresql:// URLs, which SQLAlchemy
+        # maps to psycopg2; this app ships psycopg 3.
+        for prefix in ("postgres://", "postgresql://"):
+            if value.startswith(prefix):
+                return "postgresql+psycopg://" + value.removeprefix(prefix)
+        return value
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [o.strip().rstrip("/") for o in value.split(",") if o.strip()]
+        return value
 
 
 settings = Settings()

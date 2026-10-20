@@ -352,7 +352,9 @@ class AppointmentService:
         query = select(Appointment).where(Appointment.facility_id == facility.id)
         tz = ZoneInfo(facility.timezone)
         if from_day is not None:
-            query = query.where(Appointment.starts_at >= local_day_bounds(from_day, tz)[0])
+            query = query.where(
+                Appointment.starts_at >= local_day_bounds(from_day, tz)[0]
+            )
         if to_day is not None:
             query = query.where(Appointment.starts_at < local_day_bounds(to_day, tz)[1])
         if doctor_id is not None:

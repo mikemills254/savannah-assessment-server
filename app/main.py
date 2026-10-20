@@ -1,14 +1,16 @@
 import logging
 from contextlib import asynccontextmanager
 
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
-import uvicorn
 
+from app.core.config import settings
 from app.core.errors import AppError
 from app.core.redis import redis
 from app.db.session import engine
@@ -45,6 +47,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# The deployed web client is on another origin. Auth is a bearer token, not
+# cookies, so credentials aren't allowed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+    expose_headers=["Idempotent-Replayed"],
+    max_age=600,
+)
+
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
@@ -61,16 +74,14 @@ app.include_router(patients.router)
 
 @app.get("/")
 async def read_root():
-    return {
-        "status": "ok",
-        "message": "Hello, World!"
-    }
+    return {"status": "ok", "message": "Hello, World!"}
 
 
 @app.get("/health")
 async def health() -> JSONResponse:
     """Readiness: 503 while the db or Redis can't be reached. The Docker
-    healthcheck calls this."""
+    healthcheck and the host's health check call this; the deploy pipeline
+    reads `commit` to confirm the new version is live."""
     checks = {"database": "ok", "redis": "ok"}
     try:
         await run_in_threadpool(ping_db)
@@ -83,7 +94,11 @@ async def health() -> JSONResponse:
     healthy = all(v == "ok" for v in checks.values())
     return JSONResponse(
         status_code=200 if healthy else 503,
-        content={"status": "ok" if healthy else "unavailable", **checks},
+        content={
+            "status": "ok" if healthy else "unavailable",
+            **checks,
+            "commit": settings.git_commit,
+        },
     )
 
 

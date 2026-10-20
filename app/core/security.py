@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import jwt
@@ -26,7 +26,7 @@ def _create_token(user_id: UUID, token_type: str, expires_in: timedelta) -> str:
     payload = {
         "sub": str(user_id),
         "type": token_type,
-        "exp": datetime.now(timezone.utc) + expires_in,
+        "exp": datetime.now(UTC) + expires_in,
     }
     return jwt.encode(
         payload,

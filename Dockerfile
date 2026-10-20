@@ -37,7 +37,11 @@ EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['PORT'] + '/health', timeout=4)" || exit 1
 
-# Starts the API. Migrations run beforehand in the compose file's one-off
-# `migrate` service. exec makes uvicorn PID 1, so SIGTERM on redeploy reaches it
-# and in-flight requests finish.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port \"$PORT\""]
+# Starts the API. Migrations normally run beforehand: the compose file's
+# one-off `migrate` service, or the host's pre-deploy command. Where there is
+# no such step, MIGRATE_ON_START=true runs them here, and a failed migration
+# stops the container so the host keeps the previous version.
+# exec makes uvicorn PID 1, so SIGTERM on redeploy reaches it and in-flight
+# requests finish. --proxy-headers: behind the host's load balancer, so URLs
+# FastAPI builds (e.g. redirects) keep https. WEB_CONCURRENCY sets workers.
+CMD ["sh", "-c", "if [ \"$MIGRATE_ON_START\" = true ]; then alembic upgrade head || exit 1; fi; exec uvicorn app.main:app --host 0.0.0.0 --port \"$PORT\" --proxy-headers --forwarded-allow-ips '*'"]

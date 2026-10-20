@@ -6,12 +6,14 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
-    Enum as SQLAlchemyEnum,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
     String,
     text,
+)
+from sqlalchemy import (
+    Enum as SQLAlchemyEnum,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -129,7 +131,9 @@ class Appointment(Base):
     # Who cancelled: the patient, the doctor, or a facility admin. Null while
     # booked, and for cancellations made before this was recorded.
     cancelled_by_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="RESTRICT", name="fk_appointments_cancelled_by"),
+        ForeignKey(
+            "users.id", ondelete="RESTRICT", name="fk_appointments_cancelled_by"
+        ),
         nullable=True,
     )
 

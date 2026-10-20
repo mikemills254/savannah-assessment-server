@@ -1,0 +1,264 @@
+# CI on every pull request and push; CD when a PR is merged into master.
+#
+#   lint ─┐
+#   test ─┤
+#   migrations ─┼─> deploy (push to master only, after all checks pass)
+#   image ─┤
+#   audit ─┘
+#
+# Deploys need, on the "production" GitHub environment:
+#   secret   RENDER_DEPLOY_HOOK_URL  (Render service > Settings > Deploy Hook)
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a PR cancels its older run; runs on master queue instead, so
+# a deploy is never cut off halfway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.13"
+  # Settings the app requires at import time. Placeholders: CI sends no email.
+  JWT_SECRET_KEY: ci-only-secret-key-with-at-least-32-bytes
+  MAIL_SERVER: smtp.invalid
+  MAIL_USERNAME: ci
+  MAIL_PASSWORD: ci
+  MAIL_FROM: no-reply@example.com
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install ruff (version pinned in requirements-dev.txt)
+        run: pip install "$(grep -E '^ruff==' requirements-dev.txt)"
+      - name: Lint
+        run: ruff check --output-format=github .
+      - name: Formatting
+        run: ruff format --check --diff .
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: clinic_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/clinic_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Run tests (fails under the coverage floor in pyproject.toml)
+        run: >-
+          pytest --cov --cov-report=term --cov-report=xml
+          --junitxml=junit.xml
+      - name: Coverage summary
+        if: always()
+        run: coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            coverage.xml
+            junit.xml
+          retention-days: 14
+
+  migrations:
+    name: Migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: clinic
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/clinic
+      REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements.txt
+      - name: One head (two branches' migrations haven't diverged)
+        run: |
+          heads=$(alembic heads | wc -l)
+          if [ "$heads" -ne 1 ]; then
+            alembic heads
+            echo "::error::$heads migration heads; merge them with alembic merge"
+            exit 1
+          fi
+      - name: Upgrade a fresh database to head
+        run: alembic upgrade head
+      - name: Models match the migrations
+        run: alembic check
+      - name: Downgrade to base and upgrade again
+        run: |
+          alembic downgrade base
+          alembic upgrade head
+          alembic check
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: clinic
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          load: true
+          tags: clinic-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Migrate and start the image, then check /health
+        run: |
+          app_env=(
+            -e DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/clinic
+            -e REDIS_URL=redis://127.0.0.1:6379/0
+            -e JWT_SECRET_KEY -e MAIL_SERVER -e MAIL_USERNAME -e MAIL_PASSWORD -e MAIL_FROM
+            -e GIT_COMMIT="$GITHUB_SHA" -e PORT=8000
+          )
+          docker run --rm --network host "${app_env[@]}" clinic-api:ci alembic upgrade head
+          docker run -d --name api --network host "${app_env[@]}" clinic-api:ci
+
+          for _ in $(seq 30); do
+            if body=$(curl -fsS --max-time 3 http://127.0.0.1:8000/health); then
+              echo "$body"
+              test "$(jq -r .commit <<<"$body")" = "$GITHUB_SHA"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::The image didn't become healthy within 60s"
+          docker logs api
+          exit 1
+      - name: Container logs
+        if: failure()
+        run: docker logs api || true
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "$(grep -E '^pip-audit==' requirements-dev.txt)"
+      - name: Known vulnerabilities in runtime dependencies
+        run: pip-audit -r requirements.txt --progress-spinner off
+
+  deploy:
+    name: Deploy to production
+    needs: [lint, test, migrations, image, audit]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Check the deploy settings
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          URL: ${{ vars.PRODUCTION_URL }}
+        run: |
+          ok=true
+          [ -n "$HOOK" ] || { echo "::error::Set the RENDER_DEPLOY_HOOK_URL secret on the production environment"; ok=false; }
+          [ -n "$URL" ] || { echo "::error::Set the PRODUCTION_URL variable on the production environment"; ok=false; }
+          $ok
+
+      - name: Trigger the Render deploy of this commit
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          # The hook URL already has ?key=...; ref pins the deploy to this commit.
+          curl --fail-with-body -sS -X POST "${HOOK}&ref=${GITHUB_SHA}" -o response.json
+          echo "Render deploy: $(jq -r '.deploy.id // "accepted"' response.json 2>/dev/null || echo accepted)"
+
+      # Render runs the pre-deploy migration, starts the new instance and
+      # only switches traffic once its /health passes. This waits for that,
+      # so a failed deploy fails the pipeline instead of passing silently.
+      - name: Wait until this commit is live and healthy
+        env:
+          URL: ${{ vars.PRODUCTION_URL }}
+        run: |
+          deadline=$((SECONDS + 25 * 60))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            body=$(curl -sS --max-time 10 "${URL%/}/health" || true)
+            commit=$(jq -r '.commit // empty' <<<"$body" 2>/dev/null || true)
+            status=$(jq -r '.status // empty' <<<"$body" 2>/dev/null || true)
+            if [ "$commit" = "$GITHUB_SHA" ] && [ "$status" = ok ]; then
+              echo "$body"
+              echo "### Deployed \`${GITHUB_SHA::7}\` to ${URL}" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Live: ${commit:0:7}${commit:+ }status ${status:-unreachable}; waiting for ${GITHUB_SHA::7}"
+            sleep 20
+          done
+          echo "::error::${GITHUB_SHA::7} wasn't live within 25 minutes. Check the deploy's logs in Render."
+          exit 1

@@ -150,7 +150,9 @@ class AuthService:
         except IntegrityError:
             # A concurrent sign-in created or linked the same account first.
             self.db.rollback()
-            raise ConflictError("Sign-in conflicted with another request; try again") from None
+            raise ConflictError(
+                "Sign-in conflicted with another request; try again"
+            ) from None
 
         return user
 

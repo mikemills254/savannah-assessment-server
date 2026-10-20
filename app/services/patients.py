@@ -93,7 +93,9 @@ class PatientService:
                     User.email.ilike(pattern, escape="\\"),
                 )
             )
-        return list(self.db.scalars(query.order_by(User.name).limit(limit).offset(offset)))
+        return list(
+            self.db.scalars(query.order_by(User.name).limit(limit).offset(offset))
+        )
 
     def reissue_invite(self, facility: Facility, patient_id: UUID) -> str:
         """A new invite for one of the facility's patients who has never

@@ -177,7 +177,9 @@ def list_facility_appointments(
         date | None,
         Query(alias="date", description="One local date; same as from_date = to_date"),
     ] = None,
-    from_date: Annotated[date | None, Query(description="Local date, inclusive")] = None,
+    from_date: Annotated[
+        date | None, Query(description="Local date, inclusive")
+    ] = None,
     to_date: Annotated[date | None, Query(description="Local date, inclusive")] = None,
     doctor_id: UUID | None = None,
     status: AppointmentStatus | None = None,

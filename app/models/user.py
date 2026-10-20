@@ -6,11 +6,13 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
-    Enum as SQLAlchemyEnum,
     ForeignKey,
     String,
     UniqueConstraint,
     func,
+)
+from sqlalchemy import (
+    Enum as SQLAlchemyEnum,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
