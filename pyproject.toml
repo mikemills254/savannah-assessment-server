@@ -1,0 +1,31 @@
+# Project scripts, the equivalent of package.json "scripts". Run with `task <name>`
+# (pip install -r requirements-dev.txt); `task --list` shows them all.
+
+[tool.taskipy.settings]
+use_vars = true
+
+[tool.taskipy.variables]
+# Every docker task uses both files, so the dev-only services (pgAdmin, Redis
+# Commander) are stopped and rebuilt along with the rest.
+compose_dev = "docker compose -f docker-compose.yml -f docker-compose.dev.yml"
+
+[tool.taskipy.tasks]
+# Runs on your machine against DATABASE_URL and REDIS_URL in .env.
+dev = "uvicorn app.main:app --reload"
+
+"docker:dev" = "{compose_dev} up --build"
+"docker:dev:no-build" = "{compose_dev} up"
+"docker:down" = "{compose_dev} down"
+"docker:down:volumes" = "{compose_dev} down --volumes"
+"docker:build" = "{compose_dev} build"
+"docker:build:no-cache" = "{compose_dev} build --no-cache"
+"docker:restart" = "{compose_dev} restart"
+"docker:logs" = "{compose_dev} logs -f app"
+
+# Run inside the `migrate` container against the compose database. alembic/ is
+# bind-mounted, so a generated revision lands in your working tree.
+# task db:revision "add idempotency keys"
+"db:revision" = "{compose_dev} run --rm migrate alembic revision --autogenerate -m"
+"db:deploy" = "{compose_dev} run --rm migrate alembic upgrade head"
+"db:downgrade" = "{compose_dev} run --rm migrate alembic downgrade -1"
+"db:psql" = "{compose_dev} exec postgres psql"

@@ -3,6 +3,7 @@
 from app.models.appointment import Appointment, AppointmentStatus
 from app.models.doctor_working_hours import DoctorWorkingHour
 from app.models.facility import Facility
+from app.models.idempotent_key import IdempotencyKey
 from app.models.user import User
 
 __all__ = [
@@ -10,5 +11,6 @@ __all__ = [
     "AppointmentStatus",
     "DoctorWorkingHour",
     "Facility",
+    "IdempotencyKey",
     "User",
 ]

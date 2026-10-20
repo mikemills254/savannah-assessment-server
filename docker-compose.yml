@@ -1,0 +1,97 @@
+name: assessment-server
+
+# Inside the compose network, Postgres and Redis are reached by service name,
+# not the host-mapped localhost ports used in .env.
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: assessment-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5446}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [assessment]
+
+  redis:
+    image: redis:7-alpine
+    container_name: assessment-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD is not set in .env}"]
+    environment:
+      # Lets redis-cli (healthcheck, `docker compose exec redis redis-cli`) authenticate.
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6381}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [assessment]
+
+  # One-off: applies pending Alembic migrations, then exits. The API starts once
+  # it has succeeded, so a failing migration never serves a half-migrated db.
+  migrate:
+    image: assessment-server:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    restart: "no"
+    env_file:
+      - .env
+    environment: *app-environment
+    command: ["alembic", "upgrade", "head"]
+    # The image's HEALTHCHECK probes the HTTP server, which this doesn't run.
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [assessment]
+
+  app:
+    image: assessment-server:latest
+    container_name: assessment-server
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+      args:
+        PORT: ${PORT:-8000}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment: *app-environment
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [assessment]
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  assessment:
+    driver: bridge

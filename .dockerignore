@@ -1,0 +1,29 @@
+# Virtualenv & caches — packages are installed inside the image
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Secrets — passed at runtime via env_file, never baked into the image
+.env
+.env.*
+!.env.example
+
+# VCS, editor & tooling
+.git
+.gitignore
+.claude
+.vscode
+.idea
+docs
+*.log
+
+# Docker files themselves
+Dockerfile*
+docker-compose*.yml
+.dockerignore
