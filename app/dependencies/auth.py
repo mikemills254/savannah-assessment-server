@@ -5,16 +5,19 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
 
+from app.core.logging import bind
 from app.core.permissions import (
     FacilityPermission,
     UserRole,
     facility_permissions,
 )
 from app.core.security import decode_access_token
-from app.dependencies.db import DbSession
+from app.dependencies.db import DbSession, get_db
 from app.models.facility import Facility
 from app.models.user import User
+from app.services.auth import WITH_FACILITIES
 
 # Swagger's "Authorize" button takes the token from POST /auth/login.
 # auto_error=False so a missing header is our 401, not FastAPI's default.
@@ -28,11 +31,32 @@ def _forbidden() -> HTTPException:
     )
 
 
-def get_current_user(
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
-    ],
-    db: DbSession,
+Credentials = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)]
+
+
+def get_current_user(credentials: Credentials, db: DbSession) -> User:
+    return _authenticate(credentials, db)
+
+
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def get_streaming_user(
+    credentials: Credentials,
+    # Closed as soon as the user is loaded, rather than when the response
+    # ends, so a long-lived response doesn't hold a pooled connection.
+    db: Annotated[Session, Depends(get_db, scope="function")],
+) -> User:
+    """The caller, for routes whose response stays open, such as an event
+    stream."""
+    return _authenticate(credentials, db)
+
+
+StreamingUser = Annotated[User, Depends(get_streaming_user)]
+
+
+def _authenticate(
+    credentials: HTTPAuthorizationCredentials | None, db: Session
 ) -> User:
     credentials_error = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -47,14 +71,14 @@ def get_current_user(
     if user_id is None:
         raise credentials_error
 
-    user = db.get(User, user_id)
+    # Where they work, in the same query: GET /auth/me returns it, and the
+    # permission checks under /facilities/{id} read it.
+    user = db.get(User, user_id, options=list(WITH_FACILITIES))
     if user is None or not user.is_active:
         raise credentials_error
 
+    bind(user_id=str(user.id))
     return user
-
-
-CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 def require_super_admin(user: CurrentUser) -> User:
@@ -99,7 +123,7 @@ def get_facility_access(
         facility=facility,
         permissions=facility_permissions(
             user.role,
-            is_own_facility=user.facility_id == facility.id,
+            is_own_facility=user.works_at(facility.id),
         ),
     )
 

@@ -11,6 +11,7 @@ class AppError(Exception):
 
     status_code: int = status.HTTP_400_BAD_REQUEST
     detail: str = "Bad request"
+    headers: dict[str, str] | None = None
 
     def __init__(self, detail: str | None = None):
         if detail is not None:

@@ -1,17 +1,33 @@
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.core.errors import ConflictError, InvalidRequestError
 from app.core.google import GoogleIdentity
 from app.core.permissions import UserRole
-from app.core.security import decode_invite_token, hash_password, verify_password
+from app.core.security import (
+    create_password_reset_token,
+    decode_invite_token,
+    decode_password_reset_token,
+    fingerprint_matches,
+    hash_password,
+    verify_password,
+)
+from app.models.doctor_facility import DoctorFacility
 from app.models.facility import Facility
 from app.models.user import User
 
 # Verified against when the email is unknown, so a failed login takes the
 # same time whether or not the account exists.
 _DUMMY_HASH = hash_password("dummy-password-for-timing")
+
+# Where a user works, loaded with them in one query: an admin's facility and
+# a doctor's facility links. The auth routes send it back as
+# MeRead.facilities, and permission checks read it (User.works_at).
+WITH_FACILITIES = (
+    joinedload(User.facility),
+    joinedload(User.clinic_links).joinedload(DoctorFacility.facility),
+)
 
 
 class EmailAlreadyRegisteredError(ConflictError):
@@ -20,6 +36,10 @@ class EmailAlreadyRegisteredError(ConflictError):
 
 class InvalidInviteError(InvalidRequestError):
     detail = "Invite is invalid, expired or already used"
+
+
+class InvalidResetLinkError(InvalidRequestError):
+    detail = "This reset link is invalid, expired or already used. Ask for a new one."
 
 
 class GoogleAccountMismatchError(ConflictError):
@@ -35,8 +55,14 @@ class AuthService:
         return email.strip().lower()
 
     def get_user_by_email(self, email: str) -> User | None:
-        return self.db.scalar(
-            select(User).where(User.email == self.normalize_email(email))
+        return (
+            self.db.scalars(
+                select(User)
+                .where(User.email == self.normalize_email(email))
+                .options(*WITH_FACILITIES)
+            )
+            .unique()
+            .first()
         )
 
     def register(self, *, name: str, email: str, password: str) -> User:
@@ -125,7 +151,15 @@ class AuthService:
         """Sign in with a verified Google account. On first use it is linked
         to the account with the same email (including an invited one), or a
         new PATIENT is created. Returns None if the account is deactivated."""
-        user = self.db.scalar(select(User).where(User.google_sub == identity.sub))
+        user = (
+            self.db.scalars(
+                select(User)
+                .where(User.google_sub == identity.sub)
+                .options(*WITH_FACILITIES)
+            )
+            .unique()
+            .first()
+        )
         if user is not None:
             return user if user.is_active else None
 
@@ -150,7 +184,9 @@ class AuthService:
         except IntegrityError:
             # A concurrent sign-in created or linked the same account first.
             self.db.rollback()
-            raise ConflictError("Sign-in conflicted with another request; try again") from None
+            raise ConflictError(
+                "Sign-in conflicted with another request; try again"
+            ) from None
 
         return user
 
@@ -159,12 +195,59 @@ class AuthService:
         working once a password is set, so it can only be used once."""
         user_id = decode_invite_token(token)
         user = (
-            self.db.get(User, user_id, with_for_update=True)
+            self.db.get(
+                User,
+                user_id,
+                options=list(WITH_FACILITIES),
+                # Only the user's row: Postgres can't lock the nullable side
+                # of the outer join the facility is loaded with.
+                with_for_update={"of": User},
+            )
             if user_id is not None
             else None
         )
         if user is None or user.hashed_password is not None or not user.is_active:
             raise InvalidInviteError
+
+        user.hashed_password = hash_password(password)
+        self.db.commit()
+        return user
+
+    def request_password_reset(self, email: str) -> tuple[User, str] | None:
+        """The account and a reset token, or None if there's no active
+        account with this email. The route answers the same either way, so
+        it can't be used to find out who has an account.
+
+        Invited users who never set a password can use it too: proving they
+        own the email is all an invite does."""
+        user = self.get_user_by_email(email)
+        if user is None or not user.is_active:
+            return None
+        return user, create_password_reset_token(user.id, user.hashed_password)
+
+    def reset_password(self, *, token: str, password: str) -> User:
+        """Set a new password from a reset link. The token carries a
+        fingerprint of the password it was issued against, so it stops
+        working as soon as any password is set: each link works once."""
+        claims = decode_password_reset_token(token)
+        user = (
+            self.db.get(
+                User,
+                claims[0],
+                options=list(WITH_FACILITIES),
+                # Two uses of one link at once: the second waits, then sees
+                # the changed password and is refused.
+                with_for_update={"of": User},
+            )
+            if claims is not None
+            else None
+        )
+        if (
+            user is None
+            or not user.is_active
+            or not fingerprint_matches(claims[1], user.hashed_password)
+        ):
+            raise InvalidResetLinkError
 
         user.hashed_password = hash_password(password)
         self.db.commit()

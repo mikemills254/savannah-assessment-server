@@ -1,0 +1,25 @@
+{% extends "_layout.html" %}
+
+{% block title %}{{ facility_name }} added you as a doctor{% endblock %}
+
+{% block preheader %}Set your working hours at {{ facility_name }} so patients can book you there.{% endblock %}
+
+{% block eyebrow %}New clinic{% endblock %}
+
+{% block heading %}{{ facility_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px; font-size:16px; line-height:24px;">Hi Dr. {{ name }},</p>
+<p style="margin:0; font-size:16px; line-height:24px;">
+    <strong>{{ facility_name }}</strong> has added you as a doctor. It now appears alongside
+    your other clinics when you sign in, with its own working hours. Patients can book you
+    there once you've set them; your hours elsewhere aren't affected.
+</p>
+{% endblock %}
+
+{% block action_url %}{{ hours_url }}{% endblock %}
+{% block action_label %}Set my hours there{% endblock %}
+
+{% block expiry %}Sign in with your usual email and password. Hours at different clinics can't overlap, so you're never booked in two places at once.{% endblock %}
+
+{% block footer %}You received this email because {{ facility_name }} added you on DocConnect. If you don't work there, contact the clinic.{% endblock %}

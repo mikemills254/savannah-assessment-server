@@ -76,6 +76,19 @@ class AcceptInviteRequest(BaseModel):
     password: Password
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordResponse(BaseModel):
+    detail: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: Password
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -84,8 +97,9 @@ class TokenResponse(BaseModel):
 class MeRead(UserRead):
     """The caller. The client picks the dashboard from role."""
 
-    # The facility of a FACILITY_ADMIN or DOCTOR, null otherwise.
-    facility: FacilityRead | None
+    # Where they work: a FACILITY_ADMIN's facility (even if it's inactive),
+    # or every facility a DOCTOR is active at. Empty for everyone else.
+    facilities: list[FacilityRead] = Field(default_factory=list)
 
 
 class AuthResponse(TokenResponse):

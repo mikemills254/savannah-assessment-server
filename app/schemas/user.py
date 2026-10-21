@@ -21,7 +21,8 @@ class UserRead(BaseModel):
     email: str
     name: str
     role: UserRole
-    # Set for FACILITY_ADMIN and DOCTOR, null otherwise.
+    # A FACILITY_ADMIN's facility; null otherwise. A doctor's facilities are
+    # in MeRead.facilities.
     facility_id: UUID | None
     is_active: bool
     created_at: datetime

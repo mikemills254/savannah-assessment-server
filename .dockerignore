@@ -17,10 +17,15 @@ htmlcov
 # VCS, editor & tooling
 .git
 .gitignore
+.gitattributes
+.github
 .claude
 .vscode
 .idea
 docs
+tests
+coverage.xml
+junit.xml
 *.log
 
 # Docker files themselves

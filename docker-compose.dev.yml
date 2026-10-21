@@ -28,6 +28,8 @@ services:
       # (e.g. under Docker Desktop), so uvicorn --reload can silently miss
       # host edits. Polling trades a bit of CPU for reloads that actually fire.
       WATCHFILES_FORCE_POLLING: "true"
+      # Readable lines in `docker compose logs`; production keeps JSON.
+      LOG_FORMAT: console
     volumes:
       - ./app:/app/app
       - ./alembic:/app/alembic

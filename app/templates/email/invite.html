@@ -1,0 +1,46 @@
+{% extends "_layout.html" %}
+
+{% block title %}{% if appointment %}Your appointment at {{ facility_name }}{% else %}You're invited to join {{ facility_name }}{% endif %}{% endblock %}
+
+{% block preheader %}{% if appointment %}{{ appointment.when }} with {{ appointment.doctor }}. Set a password to manage your visit.{% else %}Set a password to activate your {{ facility_name }} account.{% endif %}{% endblock %}
+
+{% block eyebrow %}{% if appointment %}Appointment booked{% else %}You're invited{% endif %}{% endblock %}
+
+{% block heading %}{{ facility_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px; font-size:16px; line-height:24px;">Hi {% if role == "DOCTOR" %}Dr. {% endif %}{{ name }},</p>
+{% if appointment %}
+<p style="margin:0 0 20px; font-size:16px; line-height:24px;">
+    <strong>{{ facility_name }}</strong> has booked you an appointment.
+</p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px; background-color:#f3f1f7; border-radius:12px;">
+    <tr>
+        <td style="padding:18px 20px;">
+            <p style="margin:0 0 4px; font-family:Consolas, monospace; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#877e98;">When</p>
+            <p style="margin:0 0 14px; font-size:17px; font-weight:bold; color:#351d5b;">{{ appointment.when }}</p>
+            <p style="margin:0 0 4px; font-family:Consolas, monospace; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#877e98;">With</p>
+            <p style="margin:0; font-size:17px; font-weight:bold; color:#351d5b;">{{ appointment.doctor }}</p>
+        </td>
+    </tr>
+</table>
+<p style="margin:0; font-size:16px; line-height:24px;">
+    We've made you an account so you can see, move or cancel this visit yourself.
+    Set a password to get started.
+</p>
+{% else %}
+<p style="margin:0; font-size:16px; line-height:24px;">
+    You've been added {{ role_line }} at <strong>{{ facility_name }}</strong>.
+    Set a password to activate your account{% if role == "DOCTOR" %}, then set your
+    working hours so patients can book you{% elif role == "FACILITY_ADMIN" %}, then
+    you can manage the clinic's doctors and appointments{% endif %}.
+</p>
+{% endif %}
+{% endblock %}
+
+{% block action_url %}{{ invite_url }}{% endblock %}
+{% block action_label %}{% if appointment %}See my appointment{% else %}Accept invite{% endif %}{% endblock %}
+
+{% block expiry %}This link works once and expires in {{ expires_in_hours }} hours. If it has expired, ask {{ facility_name }} to send a new one.{% endblock %}
+
+{% block footer %}You received this email because {{ facility_name }} added you on DocConnect. If you weren't expecting it, you can ignore it.{% endblock %}

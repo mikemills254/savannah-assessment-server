@@ -94,3 +94,6 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_users_email'), table_name='users')
     op.drop_table('users')
     # ### end Alembic commands ###
+    # create_table made these types for the Enum columns; drop_table leaves them.
+    op.execute('DROP TYPE appointment_status')
+    op.execute('DROP TYPE user_role')

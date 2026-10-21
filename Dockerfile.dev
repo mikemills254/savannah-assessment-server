@@ -18,4 +18,6 @@ ARG PORT=8000
 ENV PORT=${PORT}
 EXPOSE ${PORT}
 
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port \"$PORT\" --reload --reload-dir app"]
+# --timeout-graceful-shutdown: open event streams would otherwise hold up
+# every reload until the browser disconnects.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port \"$PORT\" --reload --reload-dir app --timeout-graceful-shutdown 2"]

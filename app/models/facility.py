@@ -9,12 +9,14 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.appointment import Appointment
+    from app.models.doctor_facility import DoctorFacility
     from app.models.user import User
 
 
 class Facility(Base):
-    """A clinic or hospital. Its admins and doctors are users whose
-    facility_id points here."""
+    """A clinic or hospital. Its admins are users whose facility_id points
+    here; its doctors are linked through doctor_facilities, since a doctor
+    can work at several."""
 
     __tablename__ = "facilities"
 
@@ -41,7 +43,11 @@ class Facility(Base):
         nullable=False,
     )
 
+    # Its facility admins.
     staff: Mapped[list["User"]] = relationship(
+        back_populates="facility",
+    )
+    doctor_links: Mapped[list["DoctorFacility"]] = relationship(
         back_populates="facility",
     )
     appointments: Mapped[list["Appointment"]] = relationship(
