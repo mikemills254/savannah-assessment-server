@@ -43,8 +43,17 @@ def test_cors_origins_are_a_comma_separated_list(monkeypatch):
 
 def test_the_commit_comes_from_the_host(monkeypatch):
     monkeypatch.delenv("GIT_COMMIT", raising=False)
-    monkeypatch.setenv("RENDER_GIT_COMMIT", "abc123")
+    monkeypatch.setenv("SOURCE_COMMIT", "abc123")
 
     settings = Settings(database_url="postgresql://u:p@db/c", **REQUIRED)
 
     assert settings.git_commit == "abc123"
+
+
+def test_an_empty_commit_is_unknown(monkeypatch):
+    monkeypatch.delenv("GIT_COMMIT", raising=False)
+    monkeypatch.setenv("SOURCE_COMMIT", "")
+
+    settings = Settings(database_url="postgresql://u:p@db/c", **REQUIRED)
+
+    assert settings.git_commit is None

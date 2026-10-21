@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     mail_server: str
     mail_port: int = 587
     # Base URL of the web client; invite emails link to <frontend_url>/accept-invite.
-    frontend_url: str = "http://localhost:5173"
+    frontend_url: str
 
     # Browser origins allowed to call the API, comma-separated, e.g.
     # "https://clinic.example.com,https://staging.clinic.example.com". Empty
@@ -31,11 +31,17 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = []
 
     # The deployed commit, shown by /health so a deploy can check it's live.
-    # Render sets RENDER_GIT_COMMIT; elsewhere set GIT_COMMIT.
+    # Coolify sets SOURCE_COMMIT; elsewhere set GIT_COMMIT.
     git_commit: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("GIT_COMMIT", "RENDER_GIT_COMMIT"),
+        validation_alias=AliasChoices("GIT_COMMIT", "SOURCE_COMMIT"),
     )
+
+    @field_validator("git_commit")
+    @classmethod
+    def _empty_commit_is_unknown(cls, value: str | None) -> str | None:
+        # The image bakes in an empty SOURCE_COMMIT when built without one.
+        return value or None
 
     @field_validator("database_url")
     @classmethod

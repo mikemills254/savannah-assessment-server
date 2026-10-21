@@ -6,8 +6,11 @@
 #   image ─┤
 #   audit ─┘
 #
-# Deploys need, on the "production" GitHub environment:
-#   secret   RENDER_DEPLOY_HOOK_URL  (Render service > Settings > Deploy Hook)
+# Deploys need, on the "production" GitHub environment (docs/Deployment.md):
+#   secret    COOLIFY_TOKEN     (Coolify > Keys & Tokens > API tokens, "deploy")
+#   variable  COOLIFY_URL       e.g. https://coolify.example.com
+#   variable  COOLIFY_APP_UUID  (the app's page URL, or Webhooks > Deploy Webhook)
+#   variable  PRODUCTION_URL    the API's public URL
 name: CI/CD
 
 on:
@@ -222,28 +225,50 @@ jobs:
       group: deploy-production
       cancel-in-progress: false
     steps:
+      # History, to tell whether a newer master commit has replaced this one.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - name: Check the deploy settings
         env:
-          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          COOLIFY_URL: ${{ vars.COOLIFY_URL }}
+          APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
           URL: ${{ vars.PRODUCTION_URL }}
         run: |
           ok=true
-          [ -n "$HOOK" ] || { echo "::error::Set the RENDER_DEPLOY_HOOK_URL secret on the production environment"; ok=false; }
+          [ -n "$TOKEN" ] || { echo "::error::Set the COOLIFY_TOKEN secret on the production environment"; ok=false; }
+          [ -n "$COOLIFY_URL" ] || { echo "::error::Set the COOLIFY_URL variable on the production environment"; ok=false; }
+          [ -n "$APP_UUID" ] || { echo "::error::Set the COOLIFY_APP_UUID variable on the production environment"; ok=false; }
           [ -n "$URL" ] || { echo "::error::Set the PRODUCTION_URL variable on the production environment"; ok=false; }
           $ok
 
-      - name: Trigger the Render deploy of this commit
+      # Coolify builds the head of the app's branch; it can't be pinned to a
+      # commit. If master has already moved on, the newer run deploys it.
+      - name: Trigger the Coolify deploy
+        id: trigger
         env:
-          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          COOLIFY_URL: ${{ vars.COOLIFY_URL }}
+          APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
         run: |
-          # The hook URL already has ?key=...; ref pins the deploy to this commit.
-          curl --fail-with-body -sS -X POST "${HOOK}&ref=${GITHUB_SHA}" -o response.json
-          echo "Render deploy: $(jq -r '.deploy.id // "accepted"' response.json 2>/dev/null || echo accepted)"
+          git fetch -q origin master
+          if [ "$(git rev-parse origin/master)" != "$GITHUB_SHA" ]; then
+            echo "::notice::master has moved past ${GITHUB_SHA::7}; its own run deploys it."
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl --fail-with-body -sS -G "${COOLIFY_URL%/}/api/v1/deploy" \
+            --data-urlencode "uuid=${APP_UUID}" --data-urlencode "force=false" \
+            -H "Authorization: Bearer ${TOKEN}" -o response.json
+          echo "Coolify: $(jq -r '.deployments[0].message // "deployment queued"' response.json 2>/dev/null || echo queued)"
 
-      # Render runs the pre-deploy migration, starts the new instance and
-      # only switches traffic once its /health passes. This waits for that,
-      # so a failed deploy fails the pipeline instead of passing silently.
+      # Coolify builds the image, starts the new container (which migrates on
+      # start) and only switches traffic once its health check passes. This
+      # waits for that, so a failed deploy fails the pipeline.
       - name: Wait until this commit is live and healthy
+        if: steps.trigger.outputs.superseded != 'true'
         env:
           URL: ${{ vars.PRODUCTION_URL }}
         run: |
@@ -257,8 +282,15 @@ jobs:
               echo "### Deployed \`${GITHUB_SHA::7}\` to ${URL}" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
+            # A push landed during the deploy and Coolify built that instead.
+            if [ "$status" = ok ] && [ -n "$commit" ] && [ "$commit" != "$GITHUB_SHA" ] \
+              && git fetch -q origin master \
+              && git merge-base --is-ancestor "$GITHUB_SHA" "$commit" 2>/dev/null; then
+              echo "::notice::${commit:0:7}, which includes ${GITHUB_SHA::7}, is live."
+              exit 0
+            fi
             echo "Live: ${commit:0:7}${commit:+ }status ${status:-unreachable}; waiting for ${GITHUB_SHA::7}"
             sleep 20
           done
-          echo "::error::${GITHUB_SHA::7} wasn't live within 25 minutes. Check the deploy's logs in Render."
+          echo "::error::${GITHUB_SHA::7} wasn't live within 25 minutes. Check the deployment's logs in Coolify."
           exit 1

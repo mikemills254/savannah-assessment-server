@@ -26,7 +26,6 @@ docs
 tests
 coverage.xml
 junit.xml
-render.yaml
 *.log
 
 # Docker files themselves
