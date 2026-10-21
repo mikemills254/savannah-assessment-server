@@ -16,6 +16,7 @@ from app.services.appointments import (
     PatientAlreadyBookedError,
     SlotTakenError,
 )
+from tests.conftest import next_slot_start
 
 
 @pytest.fixture
@@ -126,6 +127,8 @@ class TestReschedule:
             service.reschedule(patient, appointment.id, starts_at=at(20))
         with pytest.raises(InvalidRequestError, match="in the past"):
             service.reschedule(patient, appointment.id, starts_at=last_week)
+        with pytest.raises(InvalidRequestError, match="at least 1 hour ahead"):
+            service.reschedule(patient, appointment.id, starts_at=next_slot_start())
 
     def test_cannot_move_onto_a_taken_slot(self, db, make, at, booked):
         _, doctor, patient, appointment = booked

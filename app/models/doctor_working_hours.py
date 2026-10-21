@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     CheckConstraint,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     SmallInteger,
     Time,
@@ -14,16 +15,29 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.models.facility import Facility
     from app.models.user import User
 
 
 class DoctorWorkingHour(Base):
-    """A recurring weekly working period for a doctor, in their facility's
-    local time."""
+    """A recurring weekly working period for a doctor at one facility, in
+    that facility's local time."""
 
     __tablename__ = "doctor_working_hours"
 
     __table_args__ = (
+        # The doctor must work at the facility.
+        ForeignKeyConstraint(
+            ["doctor_id", "facility_id"],
+            ["doctor_facilities.doctor_id", "doctor_facilities.facility_id"],
+            ondelete="RESTRICT",
+            name="fk_working_hours_doctor_in_facility",
+        ),
+        Index(
+            "ix_working_hours_facility_doctor",
+            "facility_id",
+            "doctor_id",
+        ),
         CheckConstraint(
             "weekday >= 0 AND weekday <= 6",
             name="ck_working_hours_weekday",
@@ -47,6 +61,11 @@ class DoctorWorkingHour(Base):
         nullable=False,
     )
 
+    facility_id: Mapped[UUID] = mapped_column(
+        ForeignKey("facilities.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
     # Monday = 0, Sunday = 6
     weekday: Mapped[int] = mapped_column(
         SmallInteger,
@@ -64,4 +83,6 @@ class DoctorWorkingHour(Base):
 
     doctor: Mapped["User"] = relationship(
         back_populates="working_hours",
+        foreign_keys=[doctor_id],
     )
+    facility: Mapped["Facility"] = relationship(foreign_keys=[facility_id])

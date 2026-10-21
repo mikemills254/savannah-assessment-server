@@ -54,6 +54,12 @@ off for all of them (they are runtime only):
 | `FRONTEND_URL` | the web client's URL, used in invite emails |
 | `MAIL_SERVER`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_FROM` | SMTP settings |
 | `GOOGLE_CLIENT_ID` | optional; unset disables Google sign-in |
+| `LOG_LEVEL` | optional, default `INFO` |
+
+Logs are JSON, one object per line, in the app's **Logs** tab. Every line from
+one request shares a `request_id`, which is also sent to the client as
+`X-Request-ID`. Rate limits are kept in the same Redis; the limits are listed
+in `app/core/rate_limit.py`.
 
 Deploy once by hand from Coolify to check it comes up, then open
 `https://<domain>/health`.
@@ -89,6 +95,18 @@ Deploy once by hand from Coolify to check it comes up, then open
 Coolify can't deploy a specific commit, only the branch head. So if master
 moves on before a deploy job starts, that job skips its trigger and leaves the
 deploy to the newer commit's run.
+
+### Live updates during a deploy
+
+Signed-in browsers hold a Server-Sent Events stream open (`GET /api/v1/events`).
+When the old container stops, uvicorn closes those streams after 5 seconds
+(`--timeout-graceful-shutdown`), and browsers reconnect to the new container
+within a few seconds and reload their data, so nothing is missed. Events reach
+every instance through Redis pub/sub, so running several containers needs no
+sticky sessions. Any proxy in front of the API must not buffer
+`text/event-stream` responses (the API sends `X-Accel-Buffering: no` for
+nginx) and must allow idle reads of at least 30 seconds, since a heartbeat is
+sent every 15.
 
 ## Rolling back
 

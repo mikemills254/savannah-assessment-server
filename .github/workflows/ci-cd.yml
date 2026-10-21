@@ -36,6 +36,7 @@ env:
   MAIL_USERNAME: ci
   MAIL_PASSWORD: ci
   MAIL_FROM: no-reply@example.com
+  FRONTEND_URL: http://localhost:5173
 
 jobs:
   lint:
@@ -68,6 +69,13 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      # The rate limit tests run against a real Redis.
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/clinic_test
@@ -178,7 +186,7 @@ jobs:
           app_env=(
             -e DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/clinic
             -e REDIS_URL=redis://127.0.0.1:6379/0
-            -e JWT_SECRET_KEY -e MAIL_SERVER -e MAIL_USERNAME -e MAIL_PASSWORD -e MAIL_FROM
+            -e JWT_SECRET_KEY -e MAIL_SERVER -e MAIL_USERNAME -e MAIL_PASSWORD -e MAIL_FROM -e FRONTEND_URL
             -e GIT_COMMIT="$GITHUB_SHA" -e PORT=8000
           )
           docker run --rm --network host "${app_env[@]}" clinic-api:ci alembic upgrade head

@@ -13,7 +13,7 @@ from app.services.appointments import (
     SlotTakenError,
 )
 from app.services.doctors import DoctorNotFoundError
-from tests.conftest import TZ
+from tests.conftest import TZ, next_slot_start
 
 
 @pytest.fixture
@@ -91,6 +91,16 @@ def test_rejects_a_time_in_the_past(db, make, clinic):
     with pytest.raises(InvalidRequestError, match="in the past"):
         AppointmentService(db).book(
             make.patient(), doctor_id=doctor.id, starts_at=yesterday_nine
+        )
+
+
+def test_rejects_a_slot_less_than_an_hour_away(db, make):
+    # Works around the clock, so only the notice rule can refuse it.
+    doctor = make.doctor(make.facility(), hours=(time(0), time(23, 30)))
+
+    with pytest.raises(InvalidRequestError, match="at least 1 hour ahead"):
+        AppointmentService(db).book(
+            make.patient(), doctor_id=doctor.id, starts_at=next_slot_start()
         )
 
 

@@ -1,4 +1,5 @@
 import hashlib
+import logging
 from datetime import UTC, date, datetime
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -21,13 +22,25 @@ from app.models.facility import Facility
 from app.models.idempotent_key import IdempotencyKey
 from app.models.user import User
 from app.services.auth import AuthService
-from app.services.availability import local_day_bounds, local_slot_starts, slot_end
+from app.services.availability import (
+    MIN_BOOKING_NOTICE,
+    local_day_bounds,
+    local_slot_starts,
+    slot_end,
+)
 from app.services.doctors import DoctorNotFoundError, DoctorService
+from app.services.events import AppointmentEvent, publish_appointment_event
 from app.services.patients import PatientService
+
+logger = logging.getLogger(__name__)
 
 
 class AppointmentNotFoundError(NotFoundError):
     detail = "Appointment not found"
+
+
+class PatientNotFoundError(NotFoundError):
+    detail = "Patient not found"
 
 
 class SlotTakenError(ConflictError):
@@ -69,6 +82,21 @@ _WITH_DETAILS = (
 )
 
 
+def _log_event(event: str, appointment: Appointment) -> None:
+    # Ids only: who the patient is and why they cancelled stay in the db.
+    logger.info(
+        "Appointment %s",
+        event.split(".")[1],
+        extra={
+            "event": event,
+            "appointment_id": str(appointment.id),
+            "facility_id": str(appointment.facility_id),
+            "doctor_id": str(appointment.doctor_id),
+            "starts_at": appointment.starts_at.isoformat(),
+        },
+    )
+
+
 def _violated_constraint(exc: IntegrityError) -> str | None:
     diag = getattr(exc.orig, "diag", None)
     return getattr(diag, "constraint_name", None)
@@ -84,23 +112,58 @@ class AppointmentService:
         *,
         doctor_id: UUID,
         starts_at: datetime,
+        facility_id: UUID | None = None,
         idempotency_key: str | None = None,
     ) -> tuple[Appointment, bool]:
         """A patient booking a 30-minute slot for themselves. Returns the
         appointment and whether it is a replay of an earlier request with the
-        same Idempotency-Key, in which case nothing new was booked."""
+        same Idempotency-Key, in which case nothing new was booked.
+
+        For a doctor at several facilities, the facility is the one whose
+        working hours the slot falls in, unless facility_id names it."""
         if patient.role != UserRole.PATIENT:
             raise ForbiddenError("Only patients can book for themselves")
 
         starts_at = starts_at.astimezone(UTC)
-        key_row, replay = self._claim_key(
-            patient, idempotency_key, f"{doctor_id}|{starts_at.isoformat()}"
-        )
+        request = f"{doctor_id}|{starts_at.isoformat()}"
+        if facility_id is not None:
+            request += f"|{facility_id}"
+        key_row, replay = self._claim_key(patient, idempotency_key, request)
         if replay is not None:
+            _log_event("appointment.replayed", replay)
             return replay, True
 
-        doctor = DoctorService(self.db).get_bookable(doctor_id)
-        return self._insert(doctor, patient, patient, starts_at, key_row), False
+        doctor, facilities = DoctorService(self.db).bookable_facilities(
+            doctor_id, facility_id
+        )
+        facility = self._facility_at(doctor, facilities, starts_at)
+        return self._insert(
+            doctor, facility, patient, patient, starts_at, key_row
+        ), False
+
+    def _facility_at(
+        self, doctor: User, facilities: list[Facility], starts_at: datetime
+    ) -> Facility:
+        """Of the doctor's facilities, the one they work at when the slot
+        starts. Their hours at different facilities can't overlap, so there
+        is at most one; with none, the first is returned and _check_slot
+        then says what's wrong with the time."""
+        if len(facilities) == 1:
+            return facilities[0]
+        doctors = DoctorService(self.db)
+        working = []
+        for facility in facilities:
+            tz = ZoneInfo(facility.timezone)
+            local = starts_at.astimezone(tz)
+            periods = doctors.periods_on(doctor.id, facility.id, local.weekday())
+            if local in local_slot_starts(local.date(), periods, tz):
+                working.append(facility)
+        if len(working) > 1:
+            raise InvalidRequestError(
+                "The doctor works at more than one facility at this time; "
+                "send facility_id to choose"
+            )
+        return working[0] if working else facilities[0]
 
     def book_for_patient(
         self,
@@ -124,14 +187,14 @@ class AppointmentService:
             f"{facility.id}|{doctor_id}|{starts_at.isoformat()}|{email}",
         )
         if replay is not None:
+            _log_event("appointment.replayed", replay)
             return replay, True
 
-        doctor = DoctorService(self.db).get_bookable(doctor_id)
-        if doctor.facility_id != facility.id:
-            raise DoctorNotFoundError
+        # Not found unless the doctor works here.
+        doctor = DoctorService(self.db).get_bookable(doctor_id, facility)
         # A new patient's account is only kept if the booking succeeds.
         patient = PatientService(self.db).get_or_create(email=email, name=patient_name)
-        return self._insert(doctor, patient, actor, starts_at, key_row), False
+        return self._insert(doctor, facility, patient, actor, starts_at, key_row), False
 
     def _claim_key(
         self,
@@ -176,15 +239,16 @@ class AppointmentService:
     def _insert(
         self,
         doctor: User,
+        facility: Facility,
         patient: User,
         booked_by: User,
         starts_at: datetime,
         key_row: IdempotencyKey | None,
     ) -> Appointment:
         """Validate the slot and save the booking."""
-        self._check_slot(doctor, starts_at)
+        self._check_slot(doctor, facility, starts_at)
         appointment = Appointment(
-            facility_id=doctor.facility_id,
+            facility_id=facility.id,
             doctor_id=doctor.id,
             patient_id=patient.id,
             booked_by_id=booked_by.id,
@@ -197,7 +261,10 @@ class AppointmentService:
         if key_row is not None:
             key_row.appointment_id = appointment.id
         self.db.commit()
-        return self._get_with_details(appointment.id)
+        _log_event("appointment.booked", appointment)
+        booked = self._get_with_details(appointment.id)
+        publish_appointment_event(AppointmentEvent.BOOKED, booked, booked_by)
+        return booked
 
     def _flush_slot(self) -> None:
         """Flush a new or moved booking.
@@ -210,25 +277,38 @@ class AppointmentService:
         except IntegrityError as exc:
             self.db.rollback()
             constraint = _violated_constraint(exc)
+            logger.info(
+                "Booking conflict",
+                extra={"event": "appointment.conflict", "constraint": constraint},
+            )
             if constraint == "uq_active_doctor_slot":
                 raise SlotTakenError from None
             if constraint == "uq_active_patient_slot":
                 raise PatientAlreadyBookedError from None
             raise
 
-    def _check_slot(self, doctor: User, starts_at: datetime) -> None:
-        tz = ZoneInfo(doctor.facility.timezone)
+    def _check_slot(
+        self, doctor: User, facility: Facility, starts_at: datetime
+    ) -> None:
+        tz = ZoneInfo(facility.timezone)
         local = starts_at.astimezone(tz)
 
         if local.minute % 30 or local.second or local.microsecond:
             raise InvalidRequestError(
                 "Appointments start on the hour or half hour in the facility's time"
             )
-        if starts_at <= datetime.now(UTC):
+        now = datetime.now(UTC)
+        if starts_at <= now:
             raise InvalidRequestError("This time is in the past")
+        if starts_at < now + MIN_BOOKING_NOTICE:
+            raise InvalidRequestError(
+                "Appointments must be booked at least 1 hour ahead; choose a later time"
+            )
 
         day = local.date()
-        periods = DoctorService(self.db).periods_on(doctor.id, day.weekday())
+        periods = DoctorService(self.db).periods_on(
+            doctor.id, facility.id, day.weekday()
+        )
         if local not in local_slot_starts(day, periods, tz):
             raise InvalidRequestError("The doctor isn't working at this time")
 
@@ -266,7 +346,10 @@ class AppointmentService:
         appointment.cancelled_by_id = user.id
         appointment.cancellation_reason = reason
         self.db.commit()
-        return self._get_with_details(appointment.id)
+        _log_event("appointment.cancelled", appointment)
+        cancelled = self._get_with_details(appointment.id)
+        publish_appointment_event(AppointmentEvent.CANCELLED, cancelled, user)
+        return cancelled
 
     def reschedule(
         self, user: User, appointment_id: UUID, *, starts_at: datetime
@@ -293,17 +376,24 @@ class AppointmentService:
         if starts_at == appointment.starts_at:
             return self._get_with_details(appointment.id)
 
+        # Same doctor, same facility: they must still be bookable there.
+        facility = appointment.facility
         try:
-            doctor = DoctorService(self.db).get_bookable(appointment.doctor_id)
+            doctor = DoctorService(self.db).get_bookable(
+                appointment.doctor_id, facility
+            )
         except DoctorNotFoundError:
             raise DoctorUnavailableError from None
-        self._check_slot(doctor, starts_at)
+        self._check_slot(doctor, facility, starts_at)
 
         appointment.starts_at = starts_at
         appointment.ends_at = slot_end(starts_at)
         self._flush_slot()
         self.db.commit()
-        return self._get_with_details(appointment.id)
+        _log_event("appointment.rescheduled", appointment)
+        moved = self._get_with_details(appointment.id)
+        publish_appointment_event(AppointmentEvent.RESCHEDULED, moved, user)
+        return moved
 
     def list_for_patient(
         self,
@@ -321,6 +411,41 @@ class AppointmentService:
             self.db.scalars(
                 query.options(*_WITH_DETAILS)
                 .order_by(Appointment.starts_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+
+    def upcoming_for_patient(
+        self,
+        actor: User,
+        patient_id: UUID,
+        *,
+        limit: int,
+        offset: int,
+    ) -> list[Appointment]:
+        """A patient's booked appointments that haven't ended (one in
+        progress included), soonest first. The patient sees all of theirs, a
+        facility admin those at their facility, and a doctor those with them.
+        Anyone else gets not found, so patients' ids can't be probed."""
+        query = select(Appointment).where(
+            Appointment.patient_id == patient_id,
+            Appointment.status == AppointmentStatus.BOOKED,
+            Appointment.ends_at > datetime.now(UTC),
+        )
+        if actor.id != patient_id:
+            # Staff permissions only ever apply at their own facility.
+            permissions = facility_permissions(actor.role, is_own_facility=True)
+            if FacilityPermission.APPOINTMENTS_VIEW_ANY in permissions:
+                query = query.where(Appointment.facility_id == actor.facility_id)
+            elif FacilityPermission.APPOINTMENTS_VIEW_OWN in permissions:
+                query = query.where(Appointment.doctor_id == actor.id)
+            else:
+                raise PatientNotFoundError
+        return list(
+            self.db.scalars(
+                query.options(*_WITH_DETAILS)
+                .order_by(Appointment.starts_at)
                 .limit(limit)
                 .offset(offset)
             )
@@ -378,7 +503,7 @@ class AppointmentService:
             return True
         permissions = facility_permissions(
             user.role,
-            is_own_facility=user.facility_id == appointment.facility_id,
+            is_own_facility=user.works_at(appointment.facility_id),
         )
         if view:
             any_, own = (

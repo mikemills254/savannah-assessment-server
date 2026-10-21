@@ -1,7 +1,10 @@
 """The HTTP contract of the booking endpoints: status codes, bodies, auth."""
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
+from app.models import Appointment
 from tests.conftest import auth
 
 
@@ -233,3 +236,82 @@ class TestReschedule:
 
         assert response.status_code == 409
         assert "cancelled" in response.json()["detail"]
+
+
+class TestPatientAppointments:
+    def upcoming(self, client, viewer, patient) -> list[dict]:
+        response = client.get(
+            f"/patients/{patient.id}/appointments", headers=auth(viewer)
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def test_the_patient_sees_upcoming_ones_soonest_first(
+        self, client, make, clinic, at
+    ):
+        _, doctor = clinic
+        patient = make.patient()
+        later = book(client, patient, doctor, at(14)).json()
+        sooner = book(client, patient, doctor, at(9)).json()
+        cancelled = book(client, patient, doctor, at(11)).json()
+        client.patch(
+            f"/appointments/{cancelled['id']}/cancel",
+            json={"reason": "Can't make it"},
+            headers=auth(patient),
+        )
+
+        listed = self.upcoming(client, patient, patient)
+
+        assert [a["id"] for a in listed] == [sooner["id"], later["id"]]
+
+    def test_past_appointments_are_left_out(self, client, db, make, clinic):
+        facility, doctor = clinic
+        patient = make.patient()
+        # Booking can't create a past one, so it's added directly.
+        start = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(hours=2)
+        db.add(
+            Appointment(
+                facility_id=facility.id,
+                doctor_id=doctor.id,
+                patient_id=patient.id,
+                starts_at=start,
+                ends_at=start + timedelta(minutes=30),
+            )
+        )
+        db.commit()
+
+        assert self.upcoming(client, patient, patient) == []
+
+    def test_staff_see_only_what_they_could_see_anyway(self, client, make, clinic, at):
+        facility, doctor = clinic
+        other_doctor = make.doctor(facility)
+        elsewhere = make.facility(name="Elsewhere")
+        far_doctor = make.doctor(elsewhere)
+        patient = make.patient()
+        with_doctor = book(client, patient, doctor, at(9)).json()
+        with_other = book(client, patient, other_doctor, at(10)).json()
+        far_away = book(client, patient, far_doctor, at(11)).json()
+
+        def ids(viewer) -> list[str]:
+            return [a["id"] for a in self.upcoming(client, viewer, patient)]
+
+        assert ids(make.admin(facility)) == [with_doctor["id"], with_other["id"]]
+        assert ids(doctor) == [with_doctor["id"]]
+        assert ids(make.admin(elsewhere)) == [far_away["id"]]
+
+    def test_404_for_another_patient(self, client, make, clinic, at):
+        _, doctor = clinic
+        patient = make.patient()
+        book(client, patient, doctor, at(9))
+
+        response = client.get(
+            f"/patients/{patient.id}/appointments", headers=auth(make.patient())
+        )
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Patient not found"}
+
+    def test_401_without_a_token(self, client, make):
+        response = client.get(f"/patients/{make.patient().id}/appointments")
+
+        assert response.status_code == 401

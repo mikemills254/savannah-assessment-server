@@ -33,10 +33,10 @@ class Appointment(Base):
     __tablename__ = "appointments"
 
     __table_args__ = (
-        # The doctor must belong to this appointment's facility.
+        # The doctor must work at this appointment's facility.
         ForeignKeyConstraint(
             ["doctor_id", "facility_id"],
-            ["users.id", "users.facility_id"],
+            ["doctor_facilities.doctor_id", "doctor_facilities.facility_id"],
             ondelete="RESTRICT",
             name="fk_appointment_doctor_in_facility",
         ),
@@ -80,8 +80,11 @@ class Appointment(Base):
         nullable=False,
     )
 
-    # The doctor's user id; the foreign key is the composite constraint above.
+    # The doctor's user id; the composite constraint above also ties it to
+    # this facility. One active booking per doctor per slot, at any facility
+    # (uq_active_doctor_slot), so a doctor is never booked at two at once.
     doctor_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT", name="fk_appointments_doctor"),
         nullable=False,
     )
 
@@ -150,8 +153,7 @@ class Appointment(Base):
 
     doctor: Mapped["User"] = relationship(
         back_populates="doctor_appointments",
-        foreign_keys=[doctor_id, facility_id],
-        overlaps="appointments,facility",
+        foreign_keys=[doctor_id],
     )
 
     patient: Mapped["User"] = relationship(

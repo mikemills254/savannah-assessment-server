@@ -14,6 +14,7 @@ from pydantic import (
 )
 
 from app.core.permissions import UserRole
+from app.schemas.doctor import NextSlotRead
 from app.schemas.user import PersonName
 
 
@@ -59,6 +60,12 @@ class FacilityRead(BaseModel):
     created_at: datetime
 
 
+class FacilityListItem(FacilityRead):
+    # The earliest free slot in the next 14 days at the facility, for "Next
+    # open: Today 14:30".
+    next_available: NextSlotRead | None
+
+
 StaffRole = Literal[UserRole.FACILITY_ADMIN, UserRole.DOCTOR]
 
 
@@ -71,8 +78,10 @@ class MemberCreate(BaseModel):
 
 
 class MemberRead(BaseModel):
-    """A facility admin or doctor. For a DOCTOR, id is the doctor_id used by
-    working hours and appointments."""
+    """A facility admin or doctor, as this facility sees them. For a DOCTOR,
+    id is the doctor_id used by working hours and appointments, and
+    is_active and created_at are about this facility: a doctor can work at
+    several."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -82,6 +91,9 @@ class MemberRead(BaseModel):
     email: str
     role: StaffRole
     is_active: bool
+    # False until they accept their invite. They can't log in before then;
+    # POST /facilities/{id}/members/{member_id}/invite issues a new one.
+    has_password: bool
     created_at: datetime
 
 

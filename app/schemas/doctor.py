@@ -22,6 +22,8 @@ class DoctorRead(BaseModel):
 
     id: UUID
     name: str
+    # The facility they're listed or shown at. A doctor can work at several;
+    # DoctorDetail.facilities lists them all.
     facility_id: UUID
 
 
@@ -56,11 +58,14 @@ class WorkingHourRead(WorkingHourBase):
 
     id: UUID
     doctor_id: UUID
+    # The facility these hours are at, in its local time.
+    facility_id: UUID
 
 
 class WorkingHoursUpdate(BaseModel):
-    """The doctor's whole weekly schedule; it replaces the current one. An
-    empty list clears it."""
+    """The doctor's whole weekly schedule at one facility; it replaces their
+    current one there. An empty list clears it. Hours at other facilities
+    are kept, and these mustn't overlap them."""
 
     periods: list[WorkingHourIn] = Field(max_length=100)
 
@@ -80,9 +85,21 @@ class WorkingHoursUpdate(BaseModel):
         return self
 
 
-class DoctorDetail(DoctorRead):
+class DoctorFacilityRead(BaseModel):
+    """A facility the doctor can be booked at, and their hours there."""
+
     facility: FacilitySummary
     working_hours: list[WorkingHourRead]
+
+
+class DoctorDetail(DoctorRead):
+    """facility_id, facility and working_hours are for the facility asked
+    for (or the doctor's first); facilities lists every facility they can
+    be booked at, first one first."""
+
+    facility: FacilitySummary
+    working_hours: list[WorkingHourRead]
+    facilities: list[DoctorFacilityRead]
 
 
 class SlotRead(BaseModel):
@@ -91,8 +108,57 @@ class SlotRead(BaseModel):
     ends_at: datetime
 
 
+class DoctorSlotRead(SlotRead):
+    # Where the slot is, for a doctor at several facilities.
+    facility_id: UUID
+
+
 class AvailabilityRead(BaseModel):
     doctor_id: UUID
     date: date
-    timezone: str
+    # The facility, when one was asked for or the doctor works at only one.
+    # For a doctor at several, null, and each slot names its facility.
+    facility_id: UUID | None
+    timezone: str | None
+    # Earliest first. Each in its facility's local time.
+    available_slots: list[DoctorSlotRead]
+
+
+class NextSlotRead(BaseModel):
+    doctor_id: UUID
+    starts_at: datetime
+    ends_at: datetime
+
+
+class DoctorDayRead(BaseModel):
+    date: date
     available_slots: list[SlotRead]
+
+
+class DoctorAvailabilityRead(BaseModel):
+    doctor_id: UUID
+    name: str
+    # The earliest free slot in the requested range.
+    next_available: SlotRead | None
+    # Every date in the range, in order.
+    days: list[DoctorDayRead]
+
+
+class DayCountRead(BaseModel):
+    date: date
+    # Free slots across all of the facility's doctors that day.
+    open_count: int
+
+
+class FacilityAvailabilityRead(BaseModel):
+    facility_id: UUID
+    timezone: str
+    # "from" is a Python keyword; it's the name in the JSON.
+    from_date: date = Field(alias="from")
+    # The last date covered, inclusive.
+    to: date
+    # The earliest free slot in the range, with any doctor.
+    next_available: NextSlotRead | None
+    days: list[DayCountRead]
+    # Bookable doctors by name, including those with no free slots.
+    doctors: list[DoctorAvailabilityRead]

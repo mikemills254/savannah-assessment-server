@@ -4,8 +4,9 @@ from enum import Enum
 class UserRole(str, Enum):
     """An account's one role, which also decides the client's dashboard.
 
-    FACILITY_ADMIN and DOCTOR belong to exactly one facility
-    (User.facility_id); SUPER_ADMIN and PATIENT belong to none."""
+    A FACILITY_ADMIN belongs to exactly one facility (User.facility_id); a
+    DOCTOR works at one or more (doctor_facilities); SUPER_ADMIN and PATIENT
+    belong to none."""
 
     SUPER_ADMIN = "SUPER_ADMIN"
     FACILITY_ADMIN = "FACILITY_ADMIN"
@@ -29,7 +30,8 @@ class FacilityPermission(str, Enum):
     APPOINTMENTS_BOOK_ANY = "appointments:book_any"
 
 
-# What staff may do at their own facility. "_OWN" permissions still need an
+# What staff may do at a facility they work at (a doctor at each of theirs).
+# "_OWN" permissions still need an
 # ownership check in the service layer (e.g. the appointment is with this
 # doctor). Booking, viewing and cancelling your own appointments as a
 # patient needs no permission.

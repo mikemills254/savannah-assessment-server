@@ -48,7 +48,7 @@ compose_dev = "docker compose -f docker-compose.yml -f docker-compose.dev.yml"
 
 [tool.taskipy.tasks]
 # Runs on your machine against DATABASE_URL and REDIS_URL in .env.
-dev = "uvicorn app.main:app --reload"
+dev = "uvicorn app.main:app --reload --timeout-graceful-shutdown 2"
 
 "docker:dev" = "{compose_dev} up --build"
 "docker:dev:no-build" = "{compose_dev} up"

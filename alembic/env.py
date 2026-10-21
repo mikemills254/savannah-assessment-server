@@ -1,19 +1,18 @@
-from logging.config import fileConfig
-
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.core.config import settings
+from app.core.logging import configure_logging
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# The app's logging rather than alembic.ini's: the same format as the API's
+# lines, and fileConfig would disable every logger created before it (the
+# app's, when the tests run migrations).
+configure_logging()
 
 import app.models  # noqa: E402, F401  registers every table on Base.metadata
 from app.db.base import Base

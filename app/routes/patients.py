@@ -1,7 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 
 from app.core.permissions import FacilityPermission
 from app.dependencies.auth import FacilityAccess, require_facility_permission
@@ -39,8 +39,11 @@ def reissue_patient_invite(
     patient_id: UUID,
     access: ManagePatients,
     db: DbSession,
+    background_tasks: BackgroundTasks,
 ) -> InviteRead:
     """New invite for a patient who has never signed in (e.g. the one from
-    their booking expired)."""
-    token = PatientService(db).reissue_invite(access.facility, patient_id)
+    their booking expired). It's emailed to them too."""
+    token = PatientService(db).reissue_invite(
+        access.facility, patient_id, background_tasks=background_tasks
+    )
     return InviteRead(invite_token=token)

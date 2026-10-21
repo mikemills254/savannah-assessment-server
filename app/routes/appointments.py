@@ -2,7 +2,7 @@ from datetime import date
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Response, status
 
 from app.core.permissions import FacilityPermission
 from app.dependencies.auth import (
@@ -66,6 +66,7 @@ def book_appointment(
         user,
         doctor_id=body.doctor_id,
         starts_at=body.starts_at,
+        facility_id=body.facility_id,
         idempotency_key=idempotency_key,
     )
     if replayed:
@@ -84,6 +85,25 @@ def list_my_appointments(
     """Your appointments as a patient, latest first."""
     return AppointmentService(db).list_for_patient(
         user, status=status, limit=limit, offset=offset
+    )
+
+
+@router.get(
+    "/patients/{patient_id}/appointments",
+    response_model=list[AppointmentRead],
+)
+def list_patient_upcoming_appointments(
+    patient_id: UUID,
+    user: CurrentUser,
+    db: DbSession,
+    limit: Limit = 50,
+    offset: Offset = 0,
+) -> list[Appointment]:
+    """A patient's upcoming appointments (booked, not yet over), soonest
+    first. The patient themselves sees all of them; a facility admin those
+    at their facility; a doctor those with them. 404 for anyone else."""
+    return AppointmentService(db).upcoming_for_patient(
+        user, patient_id, limit=limit, offset=offset
     )
 
 
@@ -143,12 +163,14 @@ def book_for_patient(
     access: BookForPatients,
     db: DbSession,
     response: Response,
+    background_tasks: BackgroundTasks,
     idempotency_key: IdempotencyKeyHeader = None,
 ) -> AppointmentBooked:
     """Facility admins: book one of the facility's doctors for a patient
-    (phone, walk-in). A patient without an account gets one, and
-    invite_token is returned to send them. Idempotency-Key works as for
-    POST /appointments."""
+    (phone, walk-in). A patient without an account gets one. A patient who
+    has never signed in is emailed the appointment with an invite, and
+    invite_token is returned too, to share by hand. Idempotency-Key works as
+    for POST /appointments; a replay sends no second email."""
     appointment, replayed = AppointmentService(db).book_for_patient(
         access.facility,
         access.user,
@@ -158,11 +180,20 @@ def book_for_patient(
         patient_name=body.patient.name,
         idempotency_key=idempotency_key,
     )
+    invite_token = PatientService.invite_token_for(appointment.patient)
     if replayed:
         response.headers["Idempotent-Replayed"] = "true"
+    elif invite_token is not None:
+        PatientService.email_invite(
+            background_tasks,
+            appointment.patient,
+            access.facility,
+            invite_token,
+            appointment=appointment,
+        )
     return AppointmentBooked(
         appointment=AppointmentRead.model_validate(appointment),
-        invite_token=PatientService.invite_token_for(appointment.patient),
+        invite_token=invite_token,
     )
 
 

@@ -52,6 +52,9 @@ ENV SOURCE_COMMIT=${SOURCE_COMMIT}
 # MIGRATE_ON_START=true runs them here, and a failed migration stops the
 # container so the host keeps the previous version.
 # exec makes uvicorn PID 1, so SIGTERM on redeploy reaches it and in-flight
-# requests finish. --proxy-headers: behind the host's load balancer, so URLs
-# FastAPI builds (e.g. redirects) keep https. WEB_CONCURRENCY sets workers.
-CMD ["sh", "-c", "if [ \"$MIGRATE_ON_START\" = true ]; then alembic upgrade head || exit 1; fi; exec uvicorn app.main:app --host 0.0.0.0 --port \"$PORT\" --proxy-headers --forwarded-allow-ips '*'"]
+# requests finish. Open event streams (GET /api/v1/events) never finish on
+# their own, so --timeout-graceful-shutdown closes them after 5s rather than
+# waiting for the host to kill the container; browsers reconnect to the new
+# one. --proxy-headers: behind the host's load balancer, so URLs FastAPI
+# builds (e.g. redirects) keep https. WEB_CONCURRENCY sets workers.
+CMD ["sh", "-c", "if [ \"$MIGRATE_ON_START\" = true ]; then alembic upgrade head || exit 1; fi; exec uvicorn app.main:app --host 0.0.0.0 --port \"$PORT\" --proxy-headers --forwarded-allow-ips '*' --timeout-graceful-shutdown 5"]

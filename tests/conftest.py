@@ -6,19 +6,24 @@ so the booking tests run against it rather than SQLite or mocks.
 The database is TEST_DATABASE_URL, or DATABASE_URL with "_test" appended to
 its name. It must end in "_test": the concurrency tests commit and then
 truncate every table.
+
+Redis is REDIS_URL's server, but database 15, which is emptied before every
+test that makes requests, so rate limits don't carry from one test to the next.
 """
 
 import os
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
 from dotenv import dotenv_values
-from sqlalchemy import Engine, create_engine, make_url, text
+from sqlalchemy import Engine, create_engine, event, make_url, text
 from sqlalchemy.orm import Session
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,26 +51,37 @@ def _test_database_url() -> str:
     return url.render_as_string(hide_password=False)
 
 
+TEST_REDIS_DB = 15
+
+
+def _test_redis_url() -> str:
+    url = urlsplit(_env("REDIS_URL") or "redis://localhost:6379/0")
+    return urlunsplit(url._replace(path=f"/{TEST_REDIS_DB}"))
+
+
 # Set before anything imports app.core.config, which reads them once.
 os.environ["DATABASE_URL"] = _test_database_url()
-os.environ["REDIS_URL"] = _env("REDIS_URL") or "redis://localhost:6379/0"
+os.environ["REDIS_URL"] = _test_redis_url()
 os.environ["JWT_SECRET_KEY"] = "test-secret-key-with-at-least-32-bytes!"
-# Placeholders: no test sends email.
+# Placeholders: no test sends email (the outbox fixture catches it).
 os.environ["MAIL_SERVER"] = "smtp.invalid"
 os.environ["MAIL_USERNAME"] = "test"
 os.environ["MAIL_PASSWORD"] = "test"
 os.environ["MAIL_FROM"] = "no-reply@example.com"
+os.environ["FRONTEND_URL"] = "http://localhost:5173"
 
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.core.permissions import UserRole  # noqa: E402
+from app.core.redis import redis_sync  # noqa: E402
 from app.core.security import create_access_token  # noqa: E402
 from app.dependencies.db import get_db  # noqa: E402
-from app.main import app  # noqa: E402
-from app.models import DoctorWorkingHour, Facility, User  # noqa: E402
+from app.main import API_PREFIX, app  # noqa: E402
+from app.models import DoctorFacility, DoctorWorkingHour, Facility, User  # noqa: E402
 
+ROOT_URL = "http://testserver"
 TZ_NAME = "Africa/Nairobi"
 TZ = ZoneInfo(TZ_NAME)
 
@@ -116,14 +132,78 @@ def db(engine: Engine) -> Iterator[Session]:
 
 
 @pytest.fixture
-def client(db: Session) -> Iterator[TestClient]:
+def count_queries(engine: Engine):
+    """with count_queries() as statements: collects the SQL run inside it.
+    Call db.expunge_all() first so nothing is already loaded, as in a real
+    request's new session."""
+
+    @contextmanager
+    def counting() -> Iterator[list[str]]:
+        statements: list[str] = []
+
+        def record(conn, cursor, statement, *args):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            yield statements
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+
+    return counting
+
+
+@pytest.fixture
+def empty_redis() -> None:
+    assert redis_sync.connection_pool.connection_kwargs["db"] == TEST_REDIS_DB
+    redis_sync.flushdb()
+
+
+@pytest.fixture
+def client(db: Session, empty_redis: None) -> Iterator[TestClient]:
+    """Paths are relative to the API prefix: client.get("/auth/me") requests
+    /api/v1/auth/me. Routes outside it need the full URL, ROOT_URL + "/health"."""
     # Not used as a context manager, so the lifespan's db/Redis startup pings
     # don't run; requests use the test's session.
     app.dependency_overrides[get_db] = lambda: db
     try:
-        yield TestClient(app)
+        yield TestClient(app, base_url=f"{ROOT_URL}{API_PREFIX}")
     finally:
         app.dependency_overrides.clear()
+
+
+@dataclass
+class SentEmail:
+    to: str
+    subject: str
+    template: str
+    body: dict
+    html: str
+
+
+@pytest.fixture(autouse=True)
+def outbox(monkeypatch) -> list[SentEmail]:
+    """Every email sent during the test, rendered with its real template
+    (so a broken template fails the test) but never delivered."""
+    from app.services import email
+
+    sent: list[SentEmail] = []
+
+    async def capture(message, template_name: str) -> None:
+        body = dict(message.template_body)
+        template = email.config.template_engine().get_template(template_name)
+        sent.append(
+            SentEmail(
+                to=str(message.recipients[0].email),
+                subject=message.subject,
+                template=template_name,
+                body=body,
+                html=template.render(**body),
+            )
+        )
+
+    monkeypatch.setattr(email, "deliver", capture)
+    return sent
 
 
 def auth(user: User) -> dict[str, str]:
@@ -155,15 +235,39 @@ class Factory:
         weekdays: range = range(7),
         **kwargs,
     ) -> User:
-        doctor = self._user(UserRole.DOCTOR, facility=facility, **kwargs)
-        self.db.add_all(
-            DoctorWorkingHour(
-                doctor_id=doctor.id, weekday=d, start_time=hours[0], end_time=hours[1]
-            )
-            for d in weekdays
-        )
-        self.db.commit()
+        doctor = self._user(UserRole.DOCTOR, **kwargs)
+        self.link(doctor, facility, hours=hours, weekdays=weekdays)
         return doctor
+
+    def link(
+        self,
+        doctor: User,
+        facility: Facility,
+        *,
+        hours: tuple[time, time] | None = (time(8), time(17)),
+        weekdays: range = range(7),
+        is_active: bool = True,
+    ) -> DoctorFacility:
+        """The doctor working at the facility too, with these hours there
+        (None for none)."""
+        link = DoctorFacility(
+            doctor_id=doctor.id, facility_id=facility.id, is_active=is_active
+        )
+        self.db.add(link)
+        self.db.flush()
+        if hours is not None:
+            self.db.add_all(
+                DoctorWorkingHour(
+                    doctor_id=doctor.id,
+                    facility_id=facility.id,
+                    weekday=d,
+                    start_time=hours[0],
+                    end_time=hours[1],
+                )
+                for d in weekdays
+            )
+        self.db.commit()
+        return link
 
     def patient(self, **kwargs) -> User:
         return self._user(UserRole.PATIENT, **kwargs)
@@ -195,6 +299,16 @@ def day() -> date:
     """A clinic-local date a week ahead: always in the future, and every test
     doctor works every weekday."""
     return datetime.now(TZ).date() + timedelta(days=7)
+
+
+def next_slot_start() -> datetime:
+    """The first half-hour boundary after now in the clinic's time: always
+    under an hour away, so too soon to book."""
+    now = datetime.now(TZ)
+    start = now.replace(minute=0, second=0, microsecond=0)
+    while start <= now:
+        start += timedelta(minutes=30)
+    return start
 
 
 @pytest.fixture

@@ -17,18 +17,25 @@ from app.schemas.doctor import FacilitySummary
 from app.schemas.patient import PatientRef
 
 
-class AppointmentCreate(BaseModel):
-    """The patient is the caller and the end time is set by the server, so
-    neither is sent."""
-
+class _SlotChoice(BaseModel):
     doctor_id: UUID
     # Must include an offset, e.g. 2026-10-20T09:00:00+03:00, and fall on the
     # hour or half hour in the facility's local time.
     starts_at: AwareDatetime = Field(examples=["2026-10-20T09:00:00+03:00"])
 
 
-class StaffAppointmentCreate(AppointmentCreate):
-    """A facility admin booking on a patient's behalf."""
+class AppointmentCreate(_SlotChoice):
+    """The patient is the caller and the end time is set by the server, so
+    neither is sent."""
+
+    # Optional: for a doctor at several facilities, the one whose working
+    # hours the slot falls in is used. Send it to say which explicitly.
+    facility_id: UUID | None = None
+
+
+class StaffAppointmentCreate(_SlotChoice):
+    """A facility admin booking on a patient's behalf, at the facility in
+    the path."""
 
     patient: PatientRef
 

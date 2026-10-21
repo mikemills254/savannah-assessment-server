@@ -61,20 +61,23 @@ def test_slot_end_is_30_minutes_of_real_time_across_a_dst_change():
     assert end.astimezone(LONDON).strftime("%H:%M") == "02:00"
 
 
-def test_available_slots_exclude_booked_and_past_ones():
+def test_available_slots_exclude_booked_ones_and_those_too_soon():
     periods = [(time(9), time(11))]
     booked = [datetime(2026, 11, 2, 7, 0, tzinfo=UTC)]  # 10:00 in Nairobi (UTC+3)
-    now = datetime(2026, 11, 2, 9, 15, tzinfo=NAIROBI)
+    now = datetime(2026, 11, 2, 8, 15, tzinfo=NAIROBI)
     free = available_slot_starts(DAY, periods, NAIROBI, booked=booked, now=now)
+    # 09:00 is only 45 minutes away.
     assert hhmm(free) == ["09:30", "10:30"]
 
 
-def test_a_slot_starting_exactly_now_is_not_available():
-    now = datetime(2026, 11, 2, 9, 0, tzinfo=NAIROBI)
-    free = available_slot_starts(
-        DAY, [(time(9), time(10))], NAIROBI, booked=[], now=now
-    )
-    assert hhmm(free) == ["09:30"]
+def test_a_slot_exactly_an_hour_away_is_available_but_not_one_sooner():
+    periods = [(time(9), time(10))]
+
+    def free(now: datetime) -> list[str]:
+        return hhmm(available_slot_starts(DAY, periods, NAIROBI, booked=[], now=now))
+
+    assert free(datetime(2026, 11, 2, 8, 0, tzinfo=NAIROBI)) == ["09:00", "09:30"]
+    assert free(datetime(2026, 11, 2, 8, 1, tzinfo=NAIROBI)) == ["09:30"]
 
 
 def test_local_day_bounds_are_the_utc_instants_of_local_midnight():

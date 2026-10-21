@@ -1,5 +1,7 @@
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
+from fastapi import BackgroundTasks
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -11,6 +13,7 @@ from app.models.appointment import Appointment
 from app.models.facility import Facility
 from app.models.user import User
 from app.services.auth import AuthService
+from app.services.email import send_invite
 
 
 class PatientNotFoundError(NotFoundError):
@@ -97,9 +100,16 @@ class PatientService:
             self.db.scalars(query.order_by(User.name).limit(limit).offset(offset))
         )
 
-    def reissue_invite(self, facility: Facility, patient_id: UUID) -> str:
+    def reissue_invite(
+        self,
+        facility: Facility,
+        patient_id: UUID,
+        *,
+        background_tasks: BackgroundTasks,
+    ) -> str:
         """A new invite for one of the facility's patients who has never
-        signed in, e.g. because the first one expired."""
+        signed in, e.g. because the first one expired. It's emailed to them
+        too."""
         patient = self.db.scalar(
             select(User).where(
                 User.id == patient_id,
@@ -117,7 +127,37 @@ class PatientService:
         token = self.invite_token_for(patient)
         if token is None:
             raise ConflictError("This patient has already signed in")
+        self.email_invite(background_tasks, patient, facility, token)
         return token
+
+    @staticmethod
+    def email_invite(
+        background_tasks: BackgroundTasks,
+        patient: User,
+        facility: Facility,
+        token: str,
+        appointment: Appointment | None = None,
+    ) -> None:
+        """Email the patient their invite after the response is sent, with
+        the visit the clinic booked for them, if any."""
+        details = None
+        if appointment is not None:
+            start = appointment.starts_at.astimezone(ZoneInfo(facility.timezone))
+            details = {
+                "doctor": appointment.doctor.name,
+                # e.g. "Tuesday 28 October 2026, 10:30"; %-d isn't portable.
+                "when": f"{start:%A} {start.day} {start:%B %Y, %H:%M}",
+            }
+        background_tasks.add_task(
+            send_invite,
+            user_id=patient.id,
+            email=patient.email,
+            name=patient.name,
+            role=patient.role,
+            facility_name=facility.name,
+            token=token,
+            appointment=details,
+        )
 
     @staticmethod
     def invite_token_for(patient: User) -> str | None:

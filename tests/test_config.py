@@ -11,6 +11,7 @@ REQUIRED = {
     "mail_password": "p",
     "mail_from": "no-reply@example.com",
     "mail_server": "smtp.invalid",
+    "frontend_url": "http://localhost:5173",
 }
 
 
