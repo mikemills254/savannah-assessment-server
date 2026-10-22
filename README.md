@@ -333,6 +333,11 @@ client's `/docs` page lists every one of them by file.
 GitHub Actions ([.github/workflows/ci-cd.yml](.github/workflows/ci-cd.yml)),
 deploying to [Coolify](https://coolify.io) on my own server.
 
+- **Deployed at:** <https://docconnectapi.mills.co.ke>
+- **Deploys from:** `master`. A push to `master` (in practice, merging a pull
+  request) runs every check, and only if all of them pass does the deploy job
+  start.
+
 - **Every pull request** runs five jobs in parallel:
   - **Lint:** `ruff check` and `ruff format --check`.
   - **Tests:** the full suite against Postgres 17 and Redis 7 service containers, with coverage. The build fails if coverage drops below 85%.
