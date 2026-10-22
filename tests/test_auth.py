@@ -1,10 +1,15 @@
-"""The signed-in user (MeRead) as the auth routes return it: facilities."""
+"""Sign-up roles (the first account is the super admin), and the signed-in
+user (MeRead) as the auth routes return it: facilities."""
 
 import pytest
+from sqlalchemy import func, select
 
+from app.core.google import GoogleIdentity
+from app.core.permissions import UserRole
 from app.core.security import create_invite_token, hash_password
-from app.models import Facility
+from app.models import Facility, User
 from app.schemas.facility import FacilityRead
+from app.services.auth import AuthService
 from tests.conftest import auth
 
 PASSWORD = "a-long-password"
@@ -42,7 +47,54 @@ def staff(make):
     return _staff
 
 
+def register(client, email: str, **extra) -> dict:
+    return client.post(
+        "/auth/register",
+        json={"name": "Someone", "email": email, "password": PASSWORD, **extra},
+    )
+
+
+class TestFirstAccount:
+    def test_the_first_sign_up_becomes_the_super_admin(self, client):
+        first = register(client, "owner@example.com")
+        second = register(client, "pat@example.com")
+
+        assert first.status_code == 201, first.text
+        assert first.json()["user"]["role"] == "SUPER_ADMIN"
+        assert second.status_code == 201, second.text
+        assert second.json()["user"]["role"] == "PATIENT"
+
+    def test_the_first_sign_up_can_not_register_a_facility(self, client, db):
+        response = register(
+            client,
+            "ada@example.com",
+            facility_name="Riverside Clinic",
+            timezone="Africa/Nairobi",
+        )
+
+        assert response.status_code == 400, response.text
+        assert db.scalar(select(func.count()).select_from(User)) == 0
+        assert db.scalar(select(func.count()).select_from(Facility)) == 0
+
+    def test_the_first_google_sign_in_becomes_the_super_admin(self, db):
+        service = AuthService(db)
+
+        first = service.login_with_google(
+            GoogleIdentity(sub="g-1", email="owner@example.com", name="Owner")
+        )
+        second = service.login_with_google(
+            GoogleIdentity(sub="g-2", email="pat@example.com", name="Pat")
+        )
+
+        assert first.role == UserRole.SUPER_ADMIN
+        assert second.role == UserRole.PATIENT
+
+
 class TestRegister:
+    @pytest.fixture(autouse=True)
+    def _not_the_first_account(self, make):
+        make.patient()
+
     def test_a_clinic_sign_up_lists_the_new_facility(self, client, db):
         response = client.post(
             "/auth/register",
@@ -68,6 +120,7 @@ class TestRegister:
         )
 
         assert response.status_code == 201, response.text
+        assert response.json()["user"]["role"] == "PATIENT"
         assert response.json()["user"]["facilities"] == []
 
 
