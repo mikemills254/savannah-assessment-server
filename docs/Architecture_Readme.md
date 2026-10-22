@@ -1,491 +1,394 @@
-# Clinic Appointment Booking System
+# Clinic Appointment Booking — Architecture
 
-## 1. Overview
+A REST API for booking 30-minute appointments with doctors across one or more clinics ("facilities"). Patients see free slots and book, cancel or reschedule. Facility admins manage doctors, working hours and the facility's appointments, and doctors manage their own hours and appointments. The rule that matters most is that no doctor, and no patient, can ever hold two active bookings for the same time, even when the requests arrive at the same moment.
 
-This project is the foundation of a clinic appointment booking platform. Patients can view a doctor's availability for a given date, book a 30-minute appointment, and cancel an existing booking. The system must prevent two patients from booking the same doctor's time slot, including when booking requests arrive concurrently.
+The system is a **modular monolith**: one FastAPI application backed by PostgreSQL, with Redis for rate limiting and live updates.
 
-The initial clinic has five doctors. The architecture is intentionally small and practical: a **modular monolith** built with FastAPI, SQLAlchemy, and PostgreSQL. It keeps deployment and operations simple while separating responsibilities so the application can evolve as requirements grow.
+## 1. Quality goals
 
-## 2. Goals and scope
+Ranked; when two goals conflict, the higher one wins.
 
-### Initial functional requirements
+| # | Goal | What it means here |
+|---|---|---|
+| 1 | **Booking correctness** | Two active bookings never overlap for one doctor, or for one patient at one facility, under any concurrency. PostgreSQL enforces this, not application code alone. |
+| 2 | **Privacy and authorization** | People see and change only the appointments they are entitled to. Resources they can't access look like they don't exist. |
+| 3 | **Correct time handling** | Slots follow each facility's local wall clock, including across daylight-saving changes and across facilities in different timezones. |
+| 4 | **Operational simplicity** | One deployable, two stateful services, zero-downtime deploys, and a health check that proves the deployed version. |
+| 5 | **Changeability** | Business rules live in services that can be tested without HTTP. The schema changes only through migrations. |
 
-- List active doctors.
-- Maintain each doctor's recurring working hours.
-- Show available 30-minute slots for a doctor on a specific date.
-- Allow an authenticated patient to book an available slot.
-- Prevent overlapping or duplicate active bookings for the same doctor.
-- Allow patients to view their own appointments and cancel them.
-- Make a cancelled slot available for another patient.
+## 2. Scope and rules
 
-### Non-functional requirements
+**In scope:** facilities with their own timezone; doctors working at one or more facilities; recurring weekly working hours; computed availability; booking (by a patient, or by a facility admin on a patient's behalf); cancellation with a reason; rescheduling; live updates; invites and password reset by email; Google sign-in.
 
-- **Correctness:** concurrent requests must not double-book a slot.
-- **Data integrity:** invalid appointments must be rejected by application validation and database constraints where possible.
-- **Security:** patients can access and cancel only their own appointments; privileged staff access is explicitly authorized.
-- **Maintainability:** business rules should be testable independently of HTTP routes.
-- **Reliability:** booking and cancellation state changes must be transactional.
-- **Scalability:** the system should be able to add doctors and serve more traffic without an immediate architectural rewrite.
-- **Observability:** important operations and failures should be diagnosable through structured logs and metrics.
+**Out of scope:** payments, medical records, reminders, waiting lists, and schedule exceptions (leave, holidays).
 
-### Assumptions
+**Business rules:**
 
-- Each appointment lasts 30 minutes and starts on a 30-minute boundary.
-- A booking is for one patient and one doctor.
-- Doctors have recurring weekly working hours.
-- The clinic has one configured timezone initially.
-- Patients must authenticate to book, view their own appointments, or cancel them.
-- Payment, medical records, prescriptions, and telemedicine are out of scope for the initial version.
-- Cancellation is allowed for a booked appointment unless a later business rule introduces a cutoff.
-- The server determines the patient from the authenticated identity; clients cannot choose another patient's ID when booking.
+- An appointment lasts 30 minutes and starts on the hour or half hour, in the facility's local time.
+- A slot must be at least **one hour** ahead when it is booked or moved to. This applies to staff as well, so availability and booking always agree.
+- A doctor's working hours are weekly periods (weekday, start, end) at a specific facility, in that facility's local time. Their hours at different facilities may not overlap.
+- Each account has **exactly one role**: `PATIENT`, `DOCTOR`, `FACILITY_ADMIN` or `SUPER_ADMIN`.
+- When a patient books, the patient is always the signed-in user. The API never accepts a `patient_id` for self-booking.
+- Nothing is deleted. Appointments are cancelled, and people and facilities are deactivated.
+- Times are accepted with any UTC offset, stored as UTC instants (`TIMESTAMPTZ`) and returned in the facility's local time with its offset.
 
-These assumptions should be revisited if the clinic's actual policies differ.
+## 3. System context
 
-## 3. Architecture at a glance
+```mermaid
+flowchart LR
+    patient([Patient])
+    doctor([Doctor])
+    fadmin([Facility admin])
+    sadmin([Super admin])
 
-```text
-Patient / Staff Web Client
-          |
-          v
-      FastAPI API
-          |
-          v
-   Routes / Controllers
-          |
-          v
-        Services
-    (business rules)
-          |
-          v
- SQLAlchemy ORM / Queries
-          |
-          v
-      PostgreSQL
+    client["Web client<br/>(React PWA, separate repo)"]
+    api["Clinic Booking API<br/>FastAPI"]
+    pg[("PostgreSQL 17")]
+    redis[("Redis 7")]
+    smtp["SMTP server"]
+    google["Google Identity"]
+
+    patient & doctor & fadmin & sadmin --> client
+    client -- "HTTPS, JSON, Bearer JWT<br/>SSE for live updates" --> api
+    api -- "all persistent state" --> pg
+    api -- "rate limits, pub/sub" --> redis
+    api -- "invites, password resets" --> smtp
+    api -- "verify ID tokens" --> google
 ```
 
-For the initial release, the API, business logic, and data-access code are deployed as one application. PostgreSQL is the source of truth for appointments and schedule data.
+| Element | Role | If it is unavailable |
+|---|---|---|
+| **API** | All business logic. Stateless, so any number of instances can run behind the proxy. | — |
+| **PostgreSQL** | Source of truth for every entity, and the final authority on booking conflicts. | The API reports unhealthy (`/health` returns 503) and requests fail. |
+| **Redis** | Shared rate-limit counters and pub/sub for live events. Never holds booking state. | Booking keeps working. Rate limits let requests through, and live events are skipped. |
+| **SMTP** | Transactional email, sent after the response. | The failure is logged and the user can ask again (reissue invite, new reset link). |
+| **Google Identity** | Public keys for checking Google sign-in tokens. | Google sign-in fails; password login still works. |
 
-Background workers and a message queue are **not required for the first booking flow**. They can be introduced when asynchronous reminders and other background tasks are added.
+## 4. Inside the API
 
-### Component responsibilities
+```text
+HTTP request
+  │  middleware: CORS → request context (X-Request-ID, access log)
+  ▼
+routes/        parse input, rate limit, authenticate, check facility permission, call a service
+  ▼
+services/      business rules and transactions; raise AppError, never HTTPException
+  ▼
+models/        SQLAlchemy entities; PostgreSQL constraints enforce the invariants
+```
 
-- **Routes / controllers:** define HTTP endpoints, parse path/query/body inputs, apply authentication and authorization dependencies, call services, and return HTTP responses. Keep route handlers thin.
-- **Pydantic schemas:** validate requests and shape responses. They are not database models and should not contain database queries.
-- **Services:** implement use cases and business rules, including availability calculation, booking, cancellation, and rescheduling if added.
-- **SQLAlchemy models:** represent persistent entities and relationships.
-- **Database session/dependencies:** provide a scoped SQLAlchemy session per request and ensure it is closed correctly.
-- **PostgreSQL:** enforce relational integrity and prevent conflicting active bookings.
-- **Authentication / authorization:** identify the caller and enforce ownership and staff permissions.
-- **Configuration:** load environment-specific settings from environment variables, with secrets excluded from source control.
-- **Logging and metrics:** capture request IDs, booking outcomes, database conflicts, and operational errors without logging sensitive patient data.
-
-A separate repository class for every model is not necessary at this scale. Add repositories when they create a useful abstraction, support complex queries, or improve testing—not simply to increase the number of files.
-
-## 4. Suggested project structure
+- **Routes are thin.** They pick the dependencies (current user, facility access), call one service method, and shape the response with a Pydantic schema.
+- **Services hold the rules** and own the transaction boundaries: each state change commits once. Services raise `AppError` subclasses (`InvalidRequestError` 400, `ForbiddenError` 403, `NotFoundError` 404, `ConflictError` 409), which `main.py` maps to `{"detail": "..."}`. This keeps services free of HTTP, so tests and scripts can call them directly.
+- **No repository layer.** Services query SQLAlchemy directly. At this size a repository per model would add files without adding a useful abstraction.
+- **Schemas never touch the database.**
 
 ```text
 app/
-├── main.py
+├── main.py                     # App, middleware, AppError → JSON handler, /health
 ├── core/
-│   ├── config.py
-│   ├── security.py
-│   └── permissions.py
-├── db/
-│   ├── session.py
-│   └── base.py
+│   ├── config.py               # Settings from environment variables
+│   ├── security.py             # Password hashing; access, invite and password-reset tokens
+│   ├── permissions.py          # Roles and facility-scoped permissions
+│   ├── errors.py               # AppError hierarchy
+│   ├── logging.py              # Structured logs with request_id / user_id
+│   ├── rate_limit.py           # Redis sliding-window limits with escalating blocks
+│   ├── redis.py                # Shared Redis clients
+│   └── google.py               # Google ID-token verification
+├── db/                         # Engine, session factory, declarative Base
 ├── models/
-│   ├── patient.py
-│   ├── doctor.py
-│   ├── doctor_working_hour.py
-│   └── appointment.py
-├── schemas/
-│   ├── patient.py
-│   ├── doctor.py
-│   ├── availability.py
-│   └── appointment.py
+│   ├── user.py                 # Every account, with one role
+│   ├── facility.py             # A clinic and its timezone
+│   ├── doctor_facility.py      # Which doctors work at which facilities
+│   ├── doctor_working_hours.py # Weekly working periods per doctor per facility
+│   ├── appointment.py          # Bookings and their lifecycle
+│   └── idempotent_key.py       # Makes booking safe to retry
+├── schemas/                    # Pydantic request/response models
 ├── services/
-│   ├── availability.py
-│   └── appointments.py
-├── routes/
-│   ├── doctors.py
-│   └── appointments.py
-└── dependencies/
-    └── auth.py
-
-alembic/
-tests/
-README.md
+│   ├── appointments.py         # Book, cancel, reschedule, list
+│   ├── availability.py         # Slot arithmetic and schedule loading
+│   ├── doctors.py              # Doctors, working hours, facility-wide availability
+│   ├── facilities.py           # Facilities and staff membership
+│   ├── patients.py             # Facility-side patient lookup and invites
+│   ├── auth.py                 # Sign-up, login, Google, invites, password reset
+│   ├── email.py                # Transactional email as background tasks
+│   └── events.py               # Live updates over Redis pub/sub
+├── routes/                     # One router per resource, mounted under /api/v1
+├── dependencies/               # Current user, facility access, DB session per request
+└── templates/email/            # HTML email templates
+alembic/                        # Migrations: the only way the schema changes
+tests/                          # Against real PostgreSQL and Redis
 ```
-
-This is a suggested organization, not a requirement to create every file before it is needed. For a small submission, closely related route and controller logic can live together.
 
 ## 5. Data model
 
-### Patient
+```mermaid
+erDiagram
+    FACILITY ||--o{ USER : "admins (facility_id)"
+    FACILITY ||--o{ DOCTOR_FACILITY : employs
+    USER ||--o{ DOCTOR_FACILITY : "doctor works at"
+    DOCTOR_FACILITY ||--o{ DOCTOR_WORKING_HOUR : "hours there"
+    DOCTOR_FACILITY ||--o{ APPOINTMENT : "booked there"
+    USER ||--o{ APPOINTMENT : "patient"
+    USER ||--o{ IDEMPOTENCY_KEY : sends
+    APPOINTMENT ||--o| IDEMPOTENCY_KEY : "created by"
 
-Stores a patient's account.
-
-| Field | Type / constraint | Purpose |
-|---|---|---|
-| `id` | Primary key | Stable internal identifier |
-| `name` | Required string | Patient's display name |
-| `email` | Required, unique | Login and communication address |
-| `hashed_password` | Nullable only if external authentication is supported | Password hash; never store plaintext passwords |
-| `is_active` | Boolean, default true | Allows an account to be disabled |
-| `created_at` | Timestamp | Audit information |
-
-Email normalization and uniqueness must be handled consistently. If email-based login is used, normalize it before checking and storing it.
-
-### Doctor
-
-Represents a doctor who can accept appointments.
-
-| Field | Type / constraint | Purpose |
-|---|---|---|
-| `id` | Primary key | Stable identifier |
-| `name` | Required string | Display name |
-| `is_active` | Boolean, default true | Prevents new bookings for inactive doctors |
-| `created_at` | Timestamp | Audit information |
-
-### DoctorWorkingHour
-
-Defines recurring weekly availability.
-
-| Field | Type / constraint | Purpose |
-|---|---|---|
-| `id` | Primary key | Stable identifier |
-| `doctor_id` | Foreign key to `Doctor.id` | Owner of the schedule rule |
-| `weekday` | Integer or enum | Day of week |
-| `start_time` | Local time | Inclusive start of working period |
-| `end_time` | Local time | Exclusive end of working period |
-
-A doctor can have multiple working-hour records per weekday, such as 09:00–12:00 and 13:00–17:00. Validate that `end_time` is after `start_time`. If overnight shifts are ever required, model them explicitly rather than relying on ambiguous time comparisons.
-
-### Appointment
-
-Represents a booking and its lifecycle.
-
-| Field | Type / constraint | Purpose |
-|---|---|---|
-| `id` | Primary key | Stable appointment identifier |
-| `patient_id` | Foreign key to `Patient.id` | Patient who booked |
-| `doctor_id` | Foreign key to `Doctor.id` | Doctor being booked |
-| `starts_at` | `TIMESTAMPTZ`, required | Appointment start instant |
-| `ends_at` | `TIMESTAMPTZ`, required | Appointment end instant |
-| `status` | Enum/string, required | Initially `BOOKED` or `CANCELLED` |
-| `created_at` | Timestamp | Booking creation time |
-| `cancelled_at` | Nullable timestamp | When cancellation occurred |
-
-For the initial scope, the service sets `ends_at` to 30 minutes after `starts_at`; it should not trust a client-supplied end time. Store appointment instants in PostgreSQL using `TIMESTAMPTZ`. Interpret recurring working hours in the clinic's configured local timezone, then convert requested appointment times to a consistent instant for storage and comparison.
-
-Cancelled appointments are retained for history and auditability. A future system may add statuses such as `COMPLETED`, `NO_SHOW`, or `CANCELLED_BY_CLINIC`, but the initial status set should remain small.
-
-### Relationships
-
-- One patient can have many appointments.
-- One doctor can have many appointments.
-- One doctor can have many working-hour records.
-- Each appointment belongs to exactly one patient and one doctor.
-
-Use foreign keys and appropriate deletion policies. Avoid cascading deletion of appointment history when a patient or doctor record is deactivated.
-
-## 6. API design
-
-All patient-specific endpoints require authentication.
-
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `GET` | `/doctors` | List active doctors |
-| `GET` | `/doctors/{doctor_id}` | Retrieve doctor details |
-| `GET` | `/doctors/{doctor_id}/availability?date=YYYY-MM-DD` | Return available slots for a local clinic date |
-| `POST` | `/appointments` | Book a slot for the authenticated patient |
-| `GET` | `/appointments/me` | List the authenticated patient's appointments |
-| `GET` | `/appointments/{appointment_id}` | Retrieve an appointment the caller is allowed to access |
-| `POST` | `/appointments/{appointment_id}/cancel` | Cancel an appointment the caller is allowed to cancel |
-
-### Example booking request
-
-```json
-{
-  "doctor_id": 3,
-  "starts_at": "2026-10-20T09:00:00+03:00"
-}
-```
-
-The authenticated patient is derived from the security context, not from a `patient_id` supplied by the client. The server calculates the end time, checks schedule rules, and attempts to create the booking.
-
-### Example availability response
-
-```json
-{
-  "doctor_id": 3,
-  "date": "2026-10-20",
-  "available_slots": [
-    {
-      "starts_at": "2026-10-20T09:00:00+03:00",
-      "ends_at": "2026-10-20T09:30:00+03:00"
-    },
-    {
-      "starts_at": "2026-10-20T09:30:00+03:00",
-      "ends_at": "2026-10-20T10:00:00+03:00"
+    FACILITY {
+        uuid id PK
+        string name
+        string timezone "IANA, e.g. Africa/Nairobi"
+        bool is_active
     }
-  ]
-}
+    USER {
+        uuid id PK
+        string email UK "lowercased"
+        string name
+        string hashed_password "null until set"
+        string google_sub UK
+        enum role
+        uuid facility_id FK "FACILITY_ADMIN only"
+        bool is_active
+    }
+    DOCTOR_FACILITY {
+        uuid doctor_id PK
+        uuid facility_id PK
+        bool is_active
+    }
+    DOCTOR_WORKING_HOUR {
+        uuid id PK
+        uuid doctor_id FK
+        uuid facility_id FK
+        smallint weekday "Mon=0..Sun=6"
+        time start_time
+        time end_time
+    }
+    APPOINTMENT {
+        uuid id PK
+        uuid facility_id FK
+        uuid doctor_id FK
+        uuid patient_id FK
+        uuid booked_by_id FK
+        timestamptz starts_at
+        timestamptz ends_at
+        enum status "BOOKED | CANCELLED"
+        timestamptz cancelled_at
+        uuid cancelled_by_id FK
+        string cancellation_reason
+    }
+    IDEMPOTENCY_KEY {
+        uuid id PK
+        uuid user_id FK
+        string key
+        string request_hash "SHA-256 of the request"
+        uuid appointment_id FK
+    }
 ```
 
-The values are illustrative. The response should only include slots that satisfy working-hour rules and have no conflicting active appointment at the time of the query.
+### Invariants the database enforces
 
-### Expected error behavior
-
-- `400 Bad Request`: malformed input or invalid time boundary.
-- `401 Unauthorized`: missing or invalid authentication.
-- `403 Forbidden`: authenticated user lacks the required permission.
-- `404 Not Found`: doctor or appointment does not exist, or the API deliberately hides a resource the caller cannot access.
-- `409 Conflict`: slot was taken by another request, or the appointment is already cancelled.
-- `422 Unprocessable Entity`: request fails schema validation, such as an invalid date or missing field.
-
-Use a consistent error response format across endpoints.
-
-## 7. Availability calculation
-
-Availability is calculated dynamically rather than storing every possible slot as a separate database row.
-
-For a requested doctor and local date:
-
-1. Validate the date and verify that the doctor exists and is active.
-2. Determine the weekday and load that doctor's working-hour records.
-3. Interpret those records in the clinic timezone.
-4. Generate candidate slots in 30-minute increments within each working period.
-5. Exclude slots that are in the past, if the clinic does not allow past bookings.
-6. Query active appointments that overlap the relevant time range.
-7. Remove any candidate slot that conflicts with an active appointment.
-8. Return the remaining slots.
-
-For a working period of 09:00–12:00, the candidates are 09:00–09:30, 09:30–10:00, 10:00–10:30, 10:30–11:00, 11:00–11:30, and 11:30–12:00.
-
-**Availability is a snapshot, not a reservation.** Another patient may book a slot after it has been displayed. The booking endpoint must independently validate the requested slot, and the database must be the final authority on concurrent booking conflicts.
-
-The first implementation can query appointments for the requested day and filter in the service. Keep the query bounded to the doctor's requested date. Add query optimization or caching only if measurements show that availability reads are expensive.
-
-## 8. Preventing double booking
-
-This is the most important correctness requirement.
-
-A naive implementation checks whether a slot is free and then inserts an appointment. Two concurrent requests can both pass the check before either insert commits. An application-level check alone is therefore insufficient.
-
-### Database-enforced uniqueness for fixed slots
-
-Because the initial system has fixed 30-minute appointments aligned to half-hour boundaries, PostgreSQL can enforce one active booking per doctor and start time with a partial unique index:
-
-```sql
-CREATE UNIQUE INDEX uq_active_doctor_slot
-ON appointments (doctor_id, starts_at)
-WHERE status = 'BOOKED';
-```
-
-This assumes appointment timestamps are normalized consistently and all appointment starts are aligned to the clinic's 30-minute slot boundaries. The service must validate both assumptions.
-
-The booking workflow is:
-
-1. Authenticate the patient.
-2. Validate the doctor, requested date/time, working hours, and slot alignment.
-3. Calculate the end time on the server.
-4. Attempt to insert the appointment within a database transaction.
-5. Commit the transaction.
-6. Return the confirmed appointment.
-7. If the unique index rejects a concurrent duplicate, roll back and return `409 Conflict`.
-
-Do not perform unrelated work inside the transaction. Catch database integrity errors at the appropriate boundary, roll back as needed, and distinguish an expected slot conflict from other integrity failures.
-
-### If appointment durations or start times become flexible
-
-A unique `(doctor_id, starts_at)` index does not prevent all possible overlaps if appointment durations vary or starts are not aligned to the fixed grid. In that case, consider a PostgreSQL exclusion constraint using a timestamp range and a condition for active bookings, or another explicit locking/reservation strategy.
-
-The invariant is that two active appointments for the same doctor must never overlap. The database design should enforce the invariant, not merely assume the service always checks correctly.
-
-## 9. Booking and cancellation workflows
-
-### Booking
-
-- Validate the request schema.
-- Authenticate the patient and derive their ID.
-- Validate that the doctor is active.
-- Validate the requested slot against working hours and schedule exceptions, if supported.
-- Calculate the end timestamp.
-- Insert and commit the appointment.
-- Translate a confirmed slot conflict into `409 Conflict`.
-- Return the persisted appointment.
-
-### Cancellation
-
-- Fetch the appointment.
-- Verify the caller owns it or has a permitted staff role.
-- Verify its status is `BOOKED`.
-- Set its status to `CANCELLED` and record `cancelled_at`.
-- Commit the update.
-- Return the updated appointment.
-
-Cancellation should be implemented as a state transition rather than deleting the record. A repeated cancellation should have a deliberate, documented response and must not corrupt appointment history.
-
-### Rescheduling
-
-Rescheduling is not required for the initial scope, but it is a likely extension. It must secure the new slot before releasing the old one, or otherwise use a transaction/workflow that guarantees a failed reschedule leaves the original appointment intact. The new slot must be protected by the same concurrency controls as a normal booking.
-
-## 10. Security and privacy
-
-- Hash passwords with a suitable password-hashing algorithm; never store plaintext passwords.
-- Use established authentication mechanisms and protect all patient-specific endpoints.
-- Enforce object-level authorization: patients can only view and cancel their own appointments.
-- Keep staff and administrator privileges separate from ordinary patient permissions.
-- Validate and normalize user input.
-- Store secrets in environment variables or a secrets manager, never in the repository.
-- Use HTTPS in production.
-- Avoid putting sensitive health details in URLs, logs, or error messages.
-- Collect only the personal information needed for the booking workflow.
-- Define appropriate retention, access, backup, and audit policies before storing medical records or other sensitive clinical data.
-- Apply least-privilege database credentials and restrict production database access.
-
-The initial product is an appointment scheduler, not an electronic medical record system. Medical history, diagnoses, prescriptions, and clinical notes require additional privacy and access-control design.
-
-## 11. Transactions, sessions, and migrations
-
-- Use a SQLAlchemy session scoped to a request or use case and close it reliably.
-- Keep transaction boundaries explicit in booking and cancellation services.
-- Never share one SQLAlchemy session across unrelated concurrent requests.
-- Use Alembic to version and apply schema changes.
-- Test migrations against PostgreSQL, including partial indexes and any PostgreSQL-specific constraints.
-- Ensure integrity errors cause appropriate rollback before the session is reused.
-- Use a production connection pool configured for the database's capacity.
-
-SQLite can be convenient for isolated experiments, but concurrency and PostgreSQL-specific constraint behavior should be tested against PostgreSQL for this assignment.
-
-## 12. Indexing and performance
-
-Start with indexes that support the actual access patterns:
-
-- Unique index on normalized patient email.
-- Index on `DoctorWorkingHour(doctor_id, weekday)`.
-- Partial unique index on active appointment `(doctor_id, starts_at)` for the fixed-slot design.
-- Index on `Appointment(patient_id, starts_at)` for patient appointment history.
-- Index on `Appointment(doctor_id, starts_at)` if it is not already adequately supported by the unique index for the queries being run.
-
-Check query plans before adding more indexes. Indexes improve some reads but add storage and write overhead. Use pagination for appointment history if it can grow large.
-
-## 13. Testing strategy
-
-Testing should cover behavior and failure cases, not just successful HTTP responses.
-
-### Unit tests
-
-- Generate 30-minute slots correctly.
-- Respect multiple working periods and boundaries.
-- Exclude occupied slots.
-- Reject times outside working hours and invalid slot boundaries.
-- Apply cancellation state transitions correctly.
-
-### Integration tests with PostgreSQL
-
-- Create and retrieve appointments.
-- Cancel an appointment and confirm the slot becomes available.
-- Reject duplicate bookings for the same doctor and start time.
-- Confirm a patient cannot cancel another patient's appointment.
-- Confirm inactive doctors cannot accept new appointments.
-- Verify that database constraints and migrations work as expected.
-
-### Concurrency test
-
-Send two booking requests concurrently for the same doctor and slot using different patients. Assert that exactly one booking succeeds and the other receives a conflict response. Run this test against PostgreSQL, not only a mocked repository or SQLite.
-
-### Other cases
-
-- Daylight-saving/timezone boundaries if applicable to the deployment timezone.
-- Doctor schedule changes and leave.
-- Past appointment requests.
-- Repeated cancellation requests.
-- Database failures and transaction rollback.
-
-## 14. Observability and operations
-
-For the initial release:
-
-- Emit structured logs with a request/correlation ID.
-- Record booking success, cancellation, conflict, and error counts.
-- Track API latency and database errors.
-- Avoid logging passwords, tokens, or sensitive patient details.
-- Provide health checks for application readiness and liveness.
-- Back up PostgreSQL and document a restore procedure.
-- Monitor error rates, connection pool saturation, and slow queries.
-
-Useful domain metrics include appointment booking success rate, booking conflict rate, cancellations, no-show rate (once attendance is tracked), and doctor schedule utilization.
-
-## 15. Future evolution
-
-The initial design should leave room for growth without implementing speculative infrastructure prematurely.
-
-### Phase 1: Reliable scheduling
-
-- Doctor working hours and availability.
-- Booking, cancellation, authentication, and ownership checks.
-- Database-enforced conflict prevention.
-- Tests, migrations, logging, and backups.
-
-### Phase 2: Clinic operations
-
-- Schedule exceptions for leave, holidays, and closures.
-- Rescheduling.
-- Appointment reminders by SMS, email, or WhatsApp.
-- Receptionist/staff workflows and walk-in bookings.
-- Waiting lists for cancelled slots.
-- Appointment status tracking, including completed and no-show appointments.
-
-Notifications should be processed asynchronously so provider delays do not block booking. When reliable delivery is required, use retry policies and idempotent job handling. A transactional outbox can prevent losing an event when a database commit succeeds but publishing to a queue fails.
-
-### Phase 3: Multiple services and clinics
-
-- Different appointment durations based on service type.
-- Multiple clinic locations and doctor assignments.
-- Per-clinic timezone, schedules, and cancellation policies.
-- Strict tenant-level data isolation and authorization.
-- Billing and payment integration where required.
-- Integration with electronic health record systems, subject to appropriate privacy and regulatory controls.
-
-### Phase 4: Scale based on evidence
-
-- Run multiple stateless API instances behind a load balancer.
-- Tune database connections and query plans.
-- Add caching for suitable, frequently read data while carefully handling invalidation.
-- Scale background workers independently.
-- Add read replicas only if the read workload and consistency requirements justify them.
-- Extract services only when independent deployment, ownership, scaling, or isolation benefits outweigh distributed-systems complexity.
-
-## 16. Key decisions and trade-offs
-
-| Decision | Reason | Trade-off |
-|---|---|---|
-| Modular monolith | Easy to develop, test, deploy, and operate at initial scale | Components are deployed together |
-| PostgreSQL as source of truth | Strong transactions, constraints, and relational modeling | Requires query and connection management |
-| Dynamic slot generation | Avoids storing every potential appointment slot | Availability is calculated on request |
-| Partial unique index for fixed slots | Database prevents concurrent duplicate bookings | Assumes fixed, aligned 30-minute slots |
-| Keep cancelled records | Preserves booking history and auditability | Records accumulate over time |
-| No Redis at the start | Current workload does not justify added complexity | May need optimization if reads become expensive |
-| Queue for notifications later | External delivery should not block booking | Adds retries, monitoring, and delivery-state complexity |
-| No microservices initially | Avoids network and deployment complexity | Independent scaling is limited until extraction |
-
-## 17. Main risks and mitigations
-
-| Risk | Mitigation |
+| Constraint | Guarantees |
 |---|---|
-| Two patients book the same slot | Database-enforced constraint and concurrency tests |
-| Availability shown becomes stale | Revalidate at booking time; treat database as authoritative |
-| Patient accesses another patient's booking | Server-side ownership checks on every protected operation |
-| Doctor is absent after appointments are booked | Add schedule exceptions and a process to notify/reschedule affected patients |
-| Notification provider is unavailable | Asynchronous delivery, retries, and failure monitoring |
-| Timezone errors create incorrect bookings | Explicit clinic timezone, timezone-aware timestamps, and tests |
-| Database outage or data loss | Backups, restore testing, monitoring, and documented recovery |
-| Scope expands too early | Roadmap features and introduce infrastructure only when justified |
+| `uq_active_doctor_slot`: unique `(doctor_id, starts_at)` where `status = 'BOOKED'` | A doctor has at most one active booking per slot, across **all** facilities |
+| `uq_active_patient_slot`: unique `(facility_id, patient_id, starts_at)` where `status = 'BOOKED'` | A patient can't hold two bookings at the same time at one facility |
+| `fk_appointment_doctor_in_facility`: `(doctor_id, facility_id)` → `doctor_facilities` | A doctor can only be booked where they work |
+| `fk_working_hours_doctor_in_facility`: same shape | A doctor only has hours where they work |
+| `ck_appointment_valid_period`, `ck_working_hours_valid_period` | End after start |
+| `ck_working_hours_weekday` | Weekday is 0–6 |
+| `ck_user_admin_has_facility` | A user has a `facility_id` if and only if they are a `FACILITY_ADMIN` |
+| `uq_idempotency_user_key`: unique `(user_id, key)` | Two requests with one Idempotency-Key can't both book |
+| Unique `users.email`, `users.google_sub` | One account per address and per Google account |
+| Every foreign key is `ON DELETE RESTRICT` | History can't be lost through cascading deletes |
 
-## 18. Conclusion
+Because the partial unique indexes cover only `BOOKED` rows, a cancelled appointment stays in the table and its slot can immediately be booked again.
 
-The initial design prioritizes correctness, clarity, and operational simplicity. FastAPI provides the HTTP layer, SQLAlchemy provides database interaction, and PostgreSQL enforces the most important data invariants. A modular monolith is sufficient for five doctors and can support meaningful growth.
+**Supporting indexes:** `appointments (patient_id, starts_at)` for a patient's history, `appointments (facility_id, starts_at)` for a facility's calendar, `doctor_working_hours (doctor_id, weekday)` and `(facility_id, doctor_id)` for schedule lookups, and `doctor_facilities (facility_id)`.
 
-The central design principle is that availability displayed to a patient is not a guarantee. The booking transaction and database constraints must remain authoritative under concurrent requests. Future capabilities—reminders, waiting lists, schedule exceptions, multiple clinics, and analytics—can be added incrementally as real operational needs emerge.
+## 6. Key flows
+
+### 6.1 Availability
+
+Slots are computed on request, never stored.
+
+1. Load the doctor's working periods at the facility for the date's weekday.
+2. Step through each period in 30-minute increments of **local wall-clock time**: 09:00–12:00 gives 09:00, 09:30, …, 11:30, whatever that day's UTC offset is. Wall times that don't exist that day (a spring-forward gap) are skipped.
+3. Remove slots that start less than an hour from now.
+4. Remove slots with an active booking for that doctor at **any** facility.
+
+`GET /doctors/{id}/availability?date=` returns one day. `GET /facilities/{id}/availability` returns every bookable doctor's free slots over a range of days (14 by default, up to 31), with a count per day and the next free slot. Both use the same `Schedules` object, which loads working hours and bookings in **two queries however many doctors or days**; tests assert the query count.
+
+Availability is a snapshot, not a reservation. Booking revalidates everything, and the database decides any race.
+
+### 6.2 Booking
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as API
+    participant P as PostgreSQL
+    participant R as Redis
+
+    C->>A: POST /api/v1/appointments {doctor_id, starts_at}<br/>Bearer JWT, Idempotency-Key
+    A->>R: rate-limit check
+    A->>A: authenticate, require role PATIENT
+    A->>P: INSERT idempotency key (flush)
+    alt key already used
+        P-->>A: unique violation
+        A-->>C: 201 with the original appointment<br/>(Idempotent-Replayed), or 422 if the body differs
+    end
+    A->>A: pick the facility whose hours contain the slot
+    A->>A: check grid alignment, not past, 1 h notice, within working hours
+    A->>P: INSERT appointment, link key, COMMIT
+    alt slot still free
+        A->>R: PUBLISH to patient, doctor and facility channels
+        A-->>C: 201 Created
+    else concurrent booking won
+        P-->>A: unique violation on uq_active_doctor_slot / uq_active_patient_slot
+        A-->>C: 409 naming which conflict
+    end
+```
+
+- **The checks before the insert exist only to give clear errors.** Correctness comes from the partial unique indexes. The service maps the violated constraint's name to `SlotTakenError` or `PatientAlreadyBookedError`, and re-raises any other integrity error.
+- **Idempotency.** The key is claimed in the same transaction as the booking. A concurrent duplicate waits on the unique index, then replays the committed booking. A failed booking rolls back its key, so a retry starts fresh. A key reused with a different request body gets 422.
+- **Which facility.** If a doctor works at several facilities, the facility is the one whose hours contain the slot, or the one named by the optional `facility_id`.
+- **Booking on a patient's behalf.** `POST /facilities/{id}/appointments` lets a facility admin book by the patient's email. An account is created if none exists (kept only if the booking succeeds), and the patient is emailed an invite. It goes through the same `_insert` path, so the same checks and constraints apply.
+
+### 6.3 Cancel and reschedule
+
+Both start with `SELECT … FOR UPDATE` on the appointment row, so concurrent changes to one appointment run one after the other.
+
+- **Cancel** (`PATCH /appointments/{id}/cancel`, with a required reason): allowed for the patient, the appointment's doctor, or an admin of its facility. It sets `CANCELLED`, `cancelled_at`, `cancelled_by_id` and `cancellation_reason`. Cancelling an appointment that is already cancelled, or has already started, returns 409 and changes nothing.
+- **Reschedule** (`PATCH /appointments/{id}/reschedule`): same doctor and facility. The new time is validated exactly like a new booking. The **same row** is updated, so the old slot is freed and the new one taken in a single commit: a failure leaves the original appointment untouched. Moving to the current time is a no-op 200, so a retry is safe.
+
+### 6.4 Working hours
+
+`PUT /facilities/{id}/doctors/{doctor_id}/working-hours` replaces a doctor's whole weekly schedule at one facility. Admins can set any doctor's hours; a doctor can set only their own.
+
+- The doctor's `users` row is locked first, so two replacements for the same doctor, at any facility, run one at a time and each sees the other's result.
+- The new hours are compared with the doctor's hours at their other active facilities **as real UTC instants over the coming week**, because weekday numbers alone can't compare facilities in different timezones. An overlap returns 409. Only the doctor is told which other facility clashes; an admin is not told where else the doctor works.
+- Existing appointments are kept even if they fall outside the new hours.
+
+### 6.5 Live updates
+
+`GET /api/v1/events` is a Server-Sent Events stream.
+
+- After a booking, cancellation or reschedule **commits**, the service publishes the appointment to Redis channels: `events:user:{patient_id}`, `events:user:{doctor_id}` and `events:facility:{facility_id}`.
+- Each stream subscribes to what its user may read: patients and doctors to their own channel, facility admins to their facility's. Super admins get 403, because they don't see bookings.
+- A message published on one API instance therefore reaches clients connected to any other.
+- Delivery is **best effort**. The stream sends `ready` once it is subscribed, and clients reload their data whenever they (re)connect, so a missed event costs at most one reload. A heartbeat every 15 s keeps proxies from closing idle streams. The stream ends when the access token expires.
+- The token is sent in the `Authorization` header (the client uses `fetch`), never in the URL.
+
+### 6.6 Accounts
+
+| Flow | Behaviour |
+|---|---|
+| First account | The first account to sign up (by email or Google) becomes the `SUPER_ADMIN`, so a new deployment needs no setup script. A transaction-scoped advisory lock means two simultaneous first sign-ups can't both get the role. A facility sign-up can't be the first account. |
+| Patient sign-up | `POST /auth/register` |
+| Facility sign-up | `POST /auth/register` with `facility_name` and `timezone` creates the facility and its admin in one transaction |
+| Staff | An admin adds a doctor or admin by email (`POST /facilities/{id}/members`). New accounts get a 72-hour invite to set a password. A doctor already working elsewhere is linked to this facility and keeps their account. |
+| Google sign-in | Verifies the ID token, links the account with the same email on first use, or creates a patient |
+| Password reset | Emails a 30-minute link. The reply is identical whether or not the account exists. The token carries a digest of the current password hash, so it works once, and older links stop working once a newer one is used. |
+| Removing staff | An admin's account is deactivated. A doctor is deactivated at this facility only, and their account is deactivated when they have no active facility left. History stays. |
+
+## 7. Security model
+
+**Authentication.**
+
+- HS256 JWT bearer tokens that expire after 60 minutes, with no refresh tokens. Every request reloads the user, so a deactivated account is refused immediately.
+- Passwords are hashed with Argon2 (`pwdlib`).
+- Auth uses bearer tokens, not cookies, so CORS doesn't allow credentials and CSRF doesn't apply.
+
+**Authorization** has two layers:
+
+1. **Facility permissions** (`core/permissions.py`). A role grants permissions only at the facility the user works at.
+
+   | Permission | Facility admin | Doctor | Super admin |
+   |---|:-:|:-:|:-:|
+   | Manage members | ✓ | | ✓ (any facility) |
+   | Manage any doctor's schedule | ✓ | | |
+   | Manage own schedule | ✓ | ✓ | |
+   | View / cancel any appointment | ✓ | | |
+   | View / cancel own appointments | ✓ | ✓ | |
+   | Book for a patient, look up patients | ✓ | | |
+
+   Patients need no facility permission to book, view or cancel their own appointments.
+
+2. **Object checks in services.** `_OWN` permissions are checked against the record (the appointment is with *this* doctor). An appointment, patient or deactivated facility the caller can't access returns **404, not 403**, so ids can't be probed.
+
+**Rate limiting** (Redis, a sliding window, atomic across instances via one Lua script). Going over a limit blocks the caller for 1, 5, 15, then 30 minutes. Redis keys hold hashes, never emails or IPs.
+
+| Policy | Limit |
+|---|---|
+| All API routes, per user (per IP when signed out) | 300 / min |
+| Login, per IP + email / per IP | 5 / min, 20 / min |
+| Register | 5 / 10 min |
+| Google login | 10 / min |
+| Accept invite, reset password | 5 / min |
+| Forgot password, per IP / per email | 5 / 10 min, 3 / 15 min |
+
+**Data handling.** Logs carry ids, never names, emails, tokens or cancellation reasons. Secrets come only from environment variables. The production database and Redis are not exposed to the internet. The container runs as an unprivileged user.
+
+## 8. Operations
+
+- **Configuration:** environment variables via `pydantic-settings` (`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET_KEY`, mail settings, `FRONTEND_URL`, `CORS_ORIGINS`, `LOG_FORMAT`, …). See `.env.example`.
+- **Logging:** one JSON object per line on stdout. Every line logged during a request carries `request_id` (also returned as `X-Request-ID`) and, once known, `user_id`. Domain events are logged as `appointment.booked`, `appointment.cancelled`, `appointment.rescheduled`, `appointment.conflict` and `appointment.replayed`.
+- **Health:** `GET /health` checks PostgreSQL and Redis, returns 503 if either is down, and reports the deployed commit. The Docker `HEALTHCHECK` and the host both use it. On startup the API exits immediately if it can't reach either service.
+- **Deployment:** Docker on a Coolify server.
+  - The new container starts alongside the old one, and traffic switches only once `/health` passes.
+  - Migrations run on start (`MIGRATE_ON_START`). If a migration fails, the new container exits and the old version keeps serving.
+  - On shutdown, open event streams are closed after 5 s, and clients reconnect to the new container.
+  - See [Deployment.md](Deployment.md).
+- **CI/CD** (GitHub Actions): lint and format check; tests against PostgreSQL 17 and Redis 7, with coverage required to stay at or above 85%; migration checks (a single head, upgrade from empty, models matching migrations, downgrade and upgrade again); a production image build; `pip-audit`. Merging to `master` deploys, then waits until `/health` reports the new commit.
+
+## 9. Testing approach
+
+Tests run against real PostgreSQL and Redis, because the main guarantees are PostgreSQL's partial indexes, composite foreign keys and row locks, so a test against SQLite or mocks would prove nothing. The test database is built by the production migrations.
+
+- **Concurrency:** simultaneous bookings for one slot on separate connections; exactly one succeeds.
+- **Time:** DST transitions (London) and a UTC+14 zone (Kiritimati), with a frozen clock.
+- **Performance shape:** the availability endpoints are asserted to run a fixed number of queries, however many doctors, bookings or facilities there are.
+- **Failure:** Redis made to fail on purpose; bookings still succeed.
+
+The per-file breakdown is in the [README](../README.md#4-tests).
+
+## 10. Architecture decisions
+
+| Decision | Alternatives considered | Why this one | Consequence |
+|---|---|---|---|
+| Modular monolith | Microservices | One team, one domain, small scale; modules already separate concerns | Scales as a unit; a module can be split out later along existing service boundaries |
+| Partial unique indexes prevent double booking | Check-then-insert in code; advisory locks; `SERIALIZABLE` transactions; a range exclusion constraint | Correct under any concurrency, with no locks held while validating, and the cheapest option for fixed aligned slots | Assumes fixed 30-minute aligned slots (see §12) |
+| Slots computed on request | A table of pre-generated slots | Nothing to generate or keep in sync when hours change | Some computation per request, bounded at two queries |
+| Facilities, and doctors at several facilities | A single implicit clinic | A facility id is cheap to add now and expensive to retrofit; doctors commonly work at more than one clinic | More concepts; cross-facility overlap checks are needed |
+| One `users` table, one role per account | Separate patient/doctor tables; many-to-many role memberships | One login, token and ownership path; permission checks stay simple | Someone who is both a doctor and an admin needs two accounts; an admin runs one facility |
+| Idempotency key claimed in the booking transaction | Client-side dedupe only; a Redis-held key | Retrying after a dropped response can never book twice, even when the retries run concurrently | One extra row per keyed booking |
+| Row locks for cancel, reschedule and hours replacement | Optimistic version columns | These are rare, short writes; locking makes the "already cancelled" and overlap checks race-free | Concurrent edits to one appointment or doctor wait briefly |
+| Redis for rate limits and pub/sub, failing open | In-process limits; Postgres `LISTEN/NOTIFY` | Limits and events must work across instances; Redis is simple and fast at both | One more service. Its outage weakens limits and drops live events but never blocks booking |
+| SSE for live updates | WebSockets; polling | Updates only flow server → client; SSE is plain HTTP and works through proxies | Clients must handle reconnects and reload on `ready` |
+| JWT access tokens without refresh | Server sessions; refresh tokens | Stateless and enough for this scope | A stolen token stays valid for up to 60 minutes |
+| Soft state (cancel, deactivate), `RESTRICT` foreign keys | Hard deletes | Audit trail and history are kept | Tables only grow |
+| UUID primary keys | Serial integers | Ids don't reveal record counts and can't be enumerated | Larger indexes |
+| API under `/api/v1` | Unversioned paths | A breaking change can ship as `/api/v2` alongside | Longer URLs |
+
+## 11. Risks and known limitations
+
+| Item | Impact | Mitigation / next step |
+|---|---|---|
+| First sign-up becomes the super admin | On a fresh deployment, whoever signs up first owns the platform | Create the owner account immediately after the first deploy, before the URL is shared |
+| No schedule exceptions (leave, holidays) | Bookings stay on days a doctor is absent | Add a `schedule_exceptions` table, subtracted in availability and checked in booking; notify affected patients |
+| Changing hours doesn't touch existing bookings | Appointments can remain outside the new hours | Report affected appointments to the admin when hours are saved |
+| Emails sent as in-process background tasks | An email is lost if the process dies right after responding; there is no retry | Transactional outbox and a worker, when delivery must be guaranteed |
+| Live events are best effort | Missed while Redis is down | Clients already reload on reconnect; add an outbox if events must be durable |
+| `idempotency_keys` never pruned | The table grows forever | Periodically delete keys older than a retention window (`created_at` is indexed) |
+| No metrics endpoint | Rates and latencies come only from logs | Add Prometheus metrics for booking outcomes, conflicts and latency |
+| No refresh tokens or revocation list | A stolen token stays usable until it expires | Shorter-lived access tokens with refresh tokens, if the threat model requires it |
+| Backups and restore are not documented | Data loss risk | Schedule PostgreSQL backups on the host and document a tested restore |
+| Single PostgreSQL instance | A single point of failure | A managed or replicated Postgres when uptime requirements justify it |
+
+## 12. Evolution
+
+Changes to make when a specific need appears, not before:
+
+- **Variable appointment lengths or unaligned starts:** replace `uq_active_doctor_slot` with an exclusion constraint on `tstzrange(starts_at, ends_at)` per doctor (`btree_gist`). The invariant (no overlapping active bookings) stays the same.
+- **Reminders and notifications:** a transactional outbox written in the booking transaction, drained by a worker; Redis is already available as the queue.
+- **More traffic:** the API is stateless and limits and events are shared through Redis, so more instances can be added behind the proxy. Then tune the connection pool, and cache facility availability, invalidated by the same appointment events.
+- **Stronger tenant isolation:** PostgreSQL row-level security keyed on `facility_id`, as a second layer behind the service checks.
+- **Splitting services:** only when a module needs independent deployment, scaling or ownership. Notifications are the most likely first candidate.

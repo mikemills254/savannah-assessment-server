@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -20,6 +20,10 @@ from app.models.user import User
 # Verified against when the email is unknown, so a failed login takes the
 # same time whether or not the account exists.
 _DUMMY_HASH = hash_password("dummy-password-for-timing")
+
+# Advisory lock key held while the first account is created, so two
+# concurrent first sign-ups can't both become the super admin.
+_FIRST_ACCOUNT_LOCK = 0x5A_FE_AD_01
 
 # Where a user works, loaded with them in one query: an admin's facility and
 # a doctor's facility links. The auth routes send it back as
@@ -46,6 +50,13 @@ class GoogleAccountMismatchError(ConflictError):
     detail = "This email's account is linked to a different Google account"
 
 
+class FirstAccountMustBePersonalError(InvalidRequestError):
+    detail = (
+        "The first account becomes the platform's super admin, so it can't "
+        "register a facility. Sign up without one first."
+    )
+
+
 class AuthService:
     def __init__(self, db: Session):
         self.db = db
@@ -65,14 +76,24 @@ class AuthService:
             .first()
         )
 
+    def _is_first_account(self) -> bool:
+        """Whether no account exists yet: the first one to sign up becomes
+        the SUPER_ADMIN, so a new deployment needs no setup step. While there
+        are none, a lock is held until the transaction ends, so a concurrent
+        sign-up waits and then sees this one."""
+        if self.db.scalar(select(User.id).limit(1)) is not None:
+            return False
+        self.db.execute(select(func.pg_advisory_xact_lock(_FIRST_ACCOUNT_LOCK)))
+        return self.db.scalar(select(User.id).limit(1)) is None
+
     def register(self, *, name: str, email: str, password: str) -> User:
-        """Public sign-up of a PATIENT. Super admins are created with
-        app.scripts.create_super_admin."""
+        """Public sign-up of a PATIENT, or of the SUPER_ADMIN if this is the
+        first account."""
         user = self._add_user(
             name=name,
             email=email,
             password=password,
-            role=UserRole.PATIENT,
+            role=UserRole.SUPER_ADMIN if self._is_first_account() else UserRole.PATIENT,
         )
         self._commit_registration()
         return user
@@ -88,7 +109,10 @@ class AuthService:
     ) -> User:
         """Sign-up of a FACILITY_ADMIN with their facility, which is live
         straight away. Both are committed together, so a failure leaves
-        neither behind."""
+        neither behind. Refused as the first account, which must be the
+        super admin, who belongs to no facility."""
+        if self._is_first_account():
+            raise FirstAccountMustBePersonalError
         facility = Facility(name=facility_name, timezone=timezone)
         self.db.add(facility)
         user = self._add_user(
@@ -150,7 +174,8 @@ class AuthService:
     def login_with_google(self, identity: GoogleIdentity) -> User | None:
         """Sign in with a verified Google account. On first use it is linked
         to the account with the same email (including an invited one), or a
-        new PATIENT is created. Returns None if the account is deactivated."""
+        new PATIENT is created (the SUPER_ADMIN, if it is the first account).
+        Returns None if the account is deactivated."""
         user = (
             self.db.scalars(
                 select(User)
@@ -170,7 +195,9 @@ class AuthService:
                 name=((identity.name or "").strip() or local_part)[:100],
                 email=self.normalize_email(identity.email),
                 hashed_password=None,
-                role=UserRole.PATIENT,
+                role=UserRole.SUPER_ADMIN
+                if self._is_first_account()
+                else UserRole.PATIENT,
             )
             self.db.add(user)
         elif not user.is_active:

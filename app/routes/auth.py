@@ -46,10 +46,11 @@ def _auth_response(user: User) -> AuthResponse:
     dependencies=[_per_ip(rate_limit.REGISTER)],
 )
 def register(body: RegisterRequest, db: DbSession) -> AuthResponse:
-    """Public sign-up, which also logs the user in. Creates a PATIENT.
+    """Public sign-up, which also logs the user in. Creates a PATIENT, or
+    the SUPER_ADMIN if no account exists yet.
 
     With facility_name (and timezone) it creates a FACILITY_ADMIN instead,
-    together with their facility."""
+    together with their facility; 400 if no account exists yet."""
     service = AuthService(db)
 
     # The request validator guarantees timezone whenever facility_name is set.

@@ -1,4 +1,5 @@
-"""Two requests racing for the same slot, on separate connections.
+"""Two requests racing for the same slot, or to be the first account, on
+separate connections.
 
 These commit for real (the per-test rollback can't be shared across
 connections), so they clean up by truncating the test database's tables.
@@ -11,8 +12,10 @@ import pytest
 from sqlalchemy import Engine, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.permissions import UserRole
 from app.models import Appointment, User
 from app.services.appointments import AppointmentService, SlotTakenError
+from app.services.auth import AuthService
 from tests.conftest import Factory
 
 
@@ -94,3 +97,18 @@ def test_a_double_submitted_booking_is_stored_once(sessions, at):
     (first, first_replayed), (second, second_replayed) = results
     assert first.id == second.id
     assert sorted([first_replayed, second_replayed]) == [False, True]
+
+
+def test_only_one_of_two_simultaneous_first_sign_ups_is_super_admin(sessions):
+    def sign_up(email):
+        return lambda db: AuthService(db).register(
+            name="Someone", email=email, password="a-long-password"
+        )
+
+    results = race(sessions, sign_up("a@example.com"), sign_up("b@example.com"))
+
+    assert not any(isinstance(r, Exception) for r in results), results
+    assert sorted(user.role for user in results) == [
+        UserRole.PATIENT,
+        UserRole.SUPER_ADMIN,
+    ]
