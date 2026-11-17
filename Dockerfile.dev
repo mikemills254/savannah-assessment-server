@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Dev image — app/ and alembic/ are bind-mounted by docker-compose.dev.yml for hot reload.
 
-FROM python:3.13-slim
+FROM python:3.15-slim
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
